@@ -5,10 +5,11 @@ import {
   Loader2, CheckCircle2, AlertCircle
 } from 'lucide-react';
 import { TranscriptionResult } from '../types';
-import { submitTranscriptionJob, pollJobStatus, fetchTranscriptJSON } from '../services/speechmatics';
+import { transcribeLocal } from '../services/localAsr';
 
 interface AudioPanelProps {
   onTranscriptionComplete: (result: TranscriptionResult) => void;
+  onPartialTranscription?: (result: TranscriptionResult) => void;
   currentTime: number;
   onTimeUpdate: (time: number) => void;
   onAudioLoaded: (duration: number) => void;
@@ -21,6 +22,7 @@ type ProcessingStep = 'idle' | 'uploading' | 'processing' | 'fetching' | 'done' 
 
 export default function AudioPanel({
   onTranscriptionComplete,
+  onPartialTranscription,
   currentTime,
   onTimeUpdate,
   onAudioLoaded,
@@ -133,7 +135,7 @@ export default function AudioPanel({
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith('audio/')) {
+    if (file && (file.type.startsWith('audio/') || file.type.startsWith('video/') || /\.(m4a|mp3|wav|ogg|flac|aac|opus|mp4)$/i.test(file.name))) {
       handleFileSelect(file);
     }
   };
@@ -141,41 +143,47 @@ export default function AudioPanel({
   const handleTranscribe = async () => {
     if (!audioFile) return;
     setProcessingStep('uploading');
-    setProcessingProgress(10);
+    setProcessingProgress(3);
     setErrorMsg('');
 
     try {
-      setProcessingMsg('Submitting audio to Speechmatics...');
-      const { jobId, apiKey } = await submitTranscriptionJob(audioFile, SELECTED_LANG, (msg) => {
-        setProcessingMsg(msg);
-      });
-
       setProcessingStep('processing');
-      setProcessingProgress(30);
-      setProcessingMsg('Processing audio...');
-
-      await pollJobStatus(jobId, apiKey, (msg) => {
-        setProcessingMsg(msg);
-        setProcessingProgress(prev => Math.min(prev + 5, 85));
-      });
-
-      setProcessingStep('fetching');
-      setProcessingProgress(90);
-      setProcessingMsg('Fetching transcript...');
+      setProcessingMsg('Running local Whisper model…');
 
       const t0 = Date.now();
-      const { segments, rawText, speakers } = await fetchTranscriptJSON(jobId, apiKey);
+      const res = await transcribeLocal(
+        audioFile,
+        { diarize: true },
+        (msg, pct) => {
+          setProcessingMsg(msg);
+          setProcessingProgress(pct);
+        },
+        // live partial transcript — render segments as they are generated
+        (segments, speakers) => {
+          onPartialTranscription?.({
+            id: 'partial',
+            fileName: audioFile.name,
+            duration,
+            language: SELECTED_LANG,
+            createdAt: new Date(),
+            segments,
+            rawText: segments.map(s => `[${s.speaker}]: ${s.text}`).join('\n\n'),
+            speakers,
+            processingTime: (Date.now() - t0) / 1000,
+          });
+        },
+      );
 
       const result: TranscriptionResult = {
         id: Date.now().toString(),
         fileName: audioFile.name,
-        duration,
-        language: SELECTED_LANG,
+        duration: res.duration || duration,
+        language: res.language || SELECTED_LANG,
         createdAt: new Date(),
-        segments,
-        rawText,
-        speakers,
-        processingTime: (Date.now() - t0) / 1000,
+        segments: res.segments,
+        rawText: res.rawText,
+        speakers: res.speakers,
+        processingTime: res.processingTime ?? (Date.now() - t0) / 1000,
       };
 
       setProcessingStep('done');
@@ -252,7 +260,7 @@ export default function AudioPanel({
             ref={fileInputRef}
             type="file"
             className="hidden"
-            accept="audio/*,.m4a,.mp3,.wav,.ogg,.flac,.aac,.opus"
+            accept="audio/*,video/mp4,.m4a,.mp3,.wav,.ogg,.flac,.aac,.opus,.mp4"
             onChange={(e) => e.target.files?.[0] && handleFileSelect(e.target.files[0])}
           />
 

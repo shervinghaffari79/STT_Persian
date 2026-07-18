@@ -17,6 +17,11 @@ export default function App() {
     setTranscription(result);
   }, []);
 
+  // live partial transcript while the backend streams segments
+  const handlePartialTranscription = useCallback((partial: TranscriptionResult) => {
+    setTranscription(partial);
+  }, []);
+
   const handleTimeUpdate = useCallback((time: number) => {
     setCurrentTime(time);
   }, []);
@@ -112,6 +117,7 @@ export default function App() {
         `}>
           <AudioPanel
             onTranscriptionComplete={handleTranscriptionComplete}
+            onPartialTranscription={handlePartialTranscription}
             currentTime={currentTime}
             onTimeUpdate={handleTimeUpdate}
             onAudioLoaded={handleAudioLoaded}

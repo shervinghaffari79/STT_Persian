@@ -1,0 +1,19 @@
+# Local Persian SOTA ASR backend
+# (assumes ffmpeg is installed on the system, e.g. `brew install ffmpeg`)
+fastapi
+uvicorn[standard]
+python-multipart
+
+# ASR pipeline
+mlx-whisper          # Apple-Silicon GPU Whisper (Metal)
+silero-vad           # voice activity detection
+pyannote.audio       # speaker diarization 3.1 (gated - needs HF token, see README)
+resemblyzer          # diarization fallback (used only if pyannote is unavailable)
+scikit-learn         # clustering (fallback)
+hazm                 # Persian text normalization
+numpy
+soundfile
+
+# local chat LLM (AI Analysis panel)
+mlx-lm               # runs Qwen3-4B-Instruct-2507-4bit on the GPU
+transformers>=4.37   # required for the Qwen2 tokenizer (do NOT let NeMo pin it to 4.33)

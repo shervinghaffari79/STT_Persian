@@ -2,10 +2,11 @@ import React, { useState, useRef, useEffect } from 'react';
 import {
   MessageSquare, Send, Plus, History, Trash2,
   Bot, User, Copy, Check, ChevronRight,
-  Sparkles, Clock, Search
+  Sparkles, Clock, Search, Square, Pencil, X
 } from 'lucide-react';
 import { ChatMessage, ChatSession, TranscriptionResult } from '../types';
-import { streamChatCompletion, generateTitle } from '../services/openrouter';
+import { streamChatCompletion, generateTitle } from '../services/localChat';
+import Markdown from './Markdown';
 
 interface ChatPanelProps {
   transcription: TranscriptionResult | null;
@@ -40,9 +41,11 @@ export default function ChatPanel({
   const [view, setView] = useState<RightPanelView>('chat');
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
   const [historySearch, setHistorySearch] = useState('');
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const abortRef = useRef<boolean>(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   const activeSession = sessions.find(s => s.id === activeSessionId) || null;
 
@@ -84,118 +87,115 @@ export default function ChatPanel({
     }
   };
 
-  const handleSend = async () => {
-    const text = input.trim();
-    if (!text || isStreaming) return;
-    setInput('');
-
-    let sessionId = activeSessionId;
-
-    // Create session if none
-    if (!sessionId) {
-      const newSession: ChatSession = {
-        id: generateId(),
-        title: 'New Chat',
-        messages: [],
-        transcriptionId: transcription?.id,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      setSessions(prev => [newSession, ...prev]);
-      sessionId = newSession.id;
-      setActiveSessionId(sessionId);
-    }
-
-    const userMsg: ChatMessage = {
-      id: generateId(),
-      role: 'user',
-      content: text,
-      timestamp: new Date(),
-    };
-
+  // Stream an assistant reply for `history` into a fresh AI message on `sessionId`.
+  const generateReply = async (
+    sessionId: string,
+    history: ChatMessage[],
+    makeTitleFrom?: string,
+  ) => {
     const aiMsgId = generateId();
     const aiMsg: ChatMessage = {
-      id: aiMsgId,
-      role: 'assistant',
-      content: '',
-      timestamp: new Date(),
-      isStreaming: true,
+      id: aiMsgId, role: 'assistant', content: '', timestamp: new Date(), isStreaming: true,
     };
-
-    // Add user message
     setSessions(prev => prev.map(s =>
-      s.id === sessionId
-        ? { ...s, messages: [...s.messages, userMsg], updatedAt: new Date() }
-        : s
-    ));
-
-    // Add empty AI message
-    setSessions(prev => prev.map(s =>
-      s.id === sessionId
-        ? { ...s, messages: [...s.messages, aiMsg], updatedAt: new Date() }
-        : s
-    ));
+      s.id === sessionId ? { ...s, messages: [...s.messages, aiMsg], updatedAt: new Date() } : s));
 
     setIsStreaming(true);
-    abortRef.current = false;
-
-    // Get current session messages for context
-    const currentSession = sessions.find(s => s.id === sessionId);
-    const historyMessages = [...(currentSession?.messages || []), userMsg];
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     await streamChatCompletion(
-      historyMessages,
+      history,
       transcription?.rawText || '',
       (token) => {
-        if (abortRef.current) return;
         setSessions(prev => prev.map(s =>
           s.id === sessionId
-            ? {
-                ...s,
-                messages: s.messages.map(m =>
-                  m.id === aiMsgId ? { ...m, content: m.content + token } : m
-                ),
-              }
-            : s
-        ));
+            ? { ...s, messages: s.messages.map(m => m.id === aiMsgId ? { ...m, content: m.content + token } : m) }
+            : s));
       },
       async () => {
         setSessions(prev => prev.map(s =>
           s.id === sessionId
-            ? {
-                ...s,
-                messages: s.messages.map(m =>
-                  m.id === aiMsgId ? { ...m, isStreaming: false } : m
-                ),
-              }
-            : s
-        ));
+            ? { ...s, messages: s.messages.map(m => m.id === aiMsgId ? { ...m, isStreaming: false } : m) }
+            : s));
         setIsStreaming(false);
-
-        // Generate title for new sessions
-        if (!currentSession || currentSession.messages.length === 0) {
-          const title = await generateTitle(text);
-          setSessions(prev => prev.map(s =>
-            s.id === sessionId ? { ...s, title } : s
-          ));
+        abortRef.current = null;
+        if (makeTitleFrom) {
+          const title = await generateTitle(makeTitleFrom);
+          setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title } : s));
         }
       },
       (err) => {
         setSessions(prev => prev.map(s =>
           s.id === sessionId
-            ? {
-                ...s,
-                messages: s.messages.map(m =>
-                  m.id === aiMsgId
-                    ? { ...m, content: `Error: ${err}`, isStreaming: false }
-                    : m
-                ),
-              }
-            : s
-        ));
+            ? { ...s, messages: s.messages.map(m => m.id === aiMsgId ? { ...m, content: `⚠️ ${err}`, isStreaming: false } : m) }
+            : s));
         setIsStreaming(false);
-      }
+        abortRef.current = null;
+      },
+      controller.signal,
     );
+  };
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text || isStreaming) return;
+    setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+
+    let sessionId = activeSessionId;
+    let isFirst = false;
+    if (!sessionId) {
+      const s: ChatSession = {
+        id: generateId(), title: 'New Chat', messages: [],
+        transcriptionId: transcription?.id, createdAt: new Date(), updatedAt: new Date(),
+      };
+      setSessions(prev => [s, ...prev]);
+      sessionId = s.id;
+      setActiveSessionId(sessionId);
+      isFirst = true;
+    } else {
+      isFirst = (sessions.find(s => s.id === sessionId)?.messages.length || 0) === 0;
+    }
+
+    const userMsg: ChatMessage = { id: generateId(), role: 'user', content: text, timestamp: new Date() };
+    setSessions(prev => prev.map(s =>
+      s.id === sessionId ? { ...s, messages: [...s.messages, userMsg], updatedAt: new Date() } : s));
+
+    const history = [...(sessions.find(s => s.id === sessionId)?.messages || []), userMsg];
+    await generateReply(sessionId, history, isFirst ? text : undefined);
+  };
+
+  // Stop an in-progress generation.
+  const handleStop = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsStreaming(false);
+  };
+
+  // Edit a previously-sent user message: truncate everything after it, then regenerate.
+  const startEdit = (msg: ChatMessage) => {
+    setEditingId(msg.id);
+    setEditText(msg.content);
+  };
+
+  const saveEdit = async () => {
+    const text = editText.trim();
+    const sessionId = activeSessionId;
+    if (!text || !sessionId || isStreaming) { setEditingId(null); return; }
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session) { setEditingId(null); return; }
+    const idx = session.messages.findIndex(m => m.id === editingId);
+    if (idx < 0) { setEditingId(null); return; }
+
+    // keep messages before the edited one, replace it with the new text
+    const kept = session.messages.slice(0, idx);
+    const editedMsg: ChatMessage = { ...session.messages[idx], content: text, timestamp: new Date() };
+    const newMessages = [...kept, editedMsg];
+    setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, messages: newMessages } : s));
+    setEditingId(null);
+    setEditText('');
+    await generateReply(sessionId, newMessages, kept.length === 0 ? text : undefined);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -374,44 +374,76 @@ export default function ChatPanel({
                     </div>
 
                     {/* Bubble */}
-                    <div className={`group flex-1 max-w-[85%] ${msg.role === 'user' ? 'flex flex-col items-end' : ''}`}>
-                      <div className={`rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed ${
-                        msg.role === 'user'
-                          ? 'chat-bubble-user text-gray-200 rounded-tr-sm'
-                          : 'chat-bubble-ai text-gray-200 rounded-tl-sm'
-                      }`}>
-                        {msg.isStreaming && msg.content === '' ? (
-                          <div className="flex items-center gap-1 py-1">
-                            {[0, 1, 2].map(i => (
-                              <div
-                                key={i}
-                                className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"
-                                style={{ animationDelay: `${i * 0.15}s` }}
-                              />
-                            ))}
+                    <div className={`group flex-1 max-w-[85%] ${msg.role === 'user' ? 'flex flex-col items-end' : ''} min-w-0`}>
+                      {editingId === msg.id ? (
+                        /* inline edit of a user question */
+                        <div className="w-full bg-[#161616] border border-indigo-500/50 rounded-2xl px-3 py-2">
+                          <textarea
+                            value={editText}
+                            onChange={e => setEditText(e.target.value)}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEdit(); }
+                              if (e.key === 'Escape') { setEditingId(null); }
+                            }}
+                            dir="auto"
+                            autoFocus
+                            className="w-full bg-transparent text-sm text-white resize-none outline-none text-right leading-relaxed"
+                            rows={2}
+                          />
+                          <div className="flex items-center justify-end gap-2 mt-1.5">
+                            <button onClick={() => setEditingId(null)}
+                              className="text-[11px] px-2 py-1 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 flex items-center gap-1">
+                              <X size={11} /> لغو
+                            </button>
+                            <button onClick={saveEdit} disabled={!editText.trim()}
+                              className="text-[11px] px-2.5 py-1 rounded-lg bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 text-white flex items-center gap-1">
+                              <Check size={11} /> ذخیره و ارسال
+                            </button>
                           </div>
-                        ) : (
-                          <div className={`whitespace-pre-wrap text-right ${msg.isStreaming ? 'typing-cursor' : ''}`} dir="rtl">
-                            {msg.content}
-                          </div>
-                        )}
-                      </div>
+                        </div>
+                      ) : (
+                        <div className={`rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed break-words ${
+                          msg.role === 'user'
+                            ? 'chat-bubble-user text-gray-200 rounded-tr-sm'
+                            : 'chat-bubble-ai text-gray-200 rounded-tl-sm'
+                        }`}>
+                          {msg.isStreaming && msg.content === '' ? (
+                            <div className="flex items-center gap-1 py-1">
+                              {[0, 1, 2].map(i => (
+                                <div key={i} className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"
+                                  style={{ animationDelay: `${i * 0.15}s` }} />
+                              ))}
+                            </div>
+                          ) : msg.role === 'assistant' ? (
+                            <div className={msg.isStreaming ? 'typing-cursor' : ''}>
+                              <Markdown content={msg.content} />
+                            </div>
+                          ) : (
+                            <div className="whitespace-pre-wrap text-right" dir="auto">{msg.content}</div>
+                          )}
+                        </div>
+                      )}
 
                       {/* Actions */}
-                      <div className={`flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 transition-opacity ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                        <span className="text-[10px] text-gray-600">{formatTime(msg.timestamp)}</span>
-                        {msg.role === 'assistant' && !msg.isStreaming && (
-                          <button
-                            onClick={() => copyMessage(msg.id, msg.content)}
-                            className="text-gray-500 hover:text-gray-300 transition-colors"
-                          >
-                            {copiedMsgId === msg.id
-                              ? <Check size={11} className="text-green-400" />
-                              : <Copy size={11} />
-                            }
-                          </button>
-                        )}
-                      </div>
+                      {editingId !== msg.id && (
+                        <div className={`flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 transition-opacity ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                          <span className="text-[10px] text-gray-600">{formatTime(msg.timestamp)}</span>
+                          {msg.role === 'user' && !isStreaming && (
+                            <button onClick={() => startEdit(msg)}
+                              className="text-gray-500 hover:text-indigo-300 transition-colors" title="ویرایش سوال">
+                              <Pencil size={11} />
+                            </button>
+                          )}
+                          {msg.role === 'assistant' && !msg.isStreaming && (
+                            <button onClick={() => copyMessage(msg.id, msg.content)}
+                              className="text-gray-500 hover:text-gray-300 transition-colors" title="کپی">
+                              {copiedMsgId === msg.id
+                                ? <Check size={11} className="text-green-400" />
+                                : <Copy size={11} />}
+                            </button>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -449,13 +481,23 @@ export default function ChatPanel({
                   el.style.height = Math.min(el.scrollHeight, 128) + 'px';
                 }}
               />
-              <button
-                onClick={handleSend}
-                disabled={!input.trim() || isStreaming}
-                className="w-8 h-8 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl flex items-center justify-center transition-all flex-shrink-0"
-              >
-                <Send size={14} className="text-white" />
-              </button>
+              {isStreaming ? (
+                <button
+                  onClick={handleStop}
+                  title="توقف تولید"
+                  className="w-8 h-8 bg-red-500/90 hover:bg-red-600 rounded-xl flex items-center justify-center transition-all flex-shrink-0"
+                >
+                  <Square size={12} className="text-white" fill="white" />
+                </button>
+              ) : (
+                <button
+                  onClick={handleSend}
+                  disabled={!input.trim()}
+                  className="w-8 h-8 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl flex items-center justify-center transition-all flex-shrink-0"
+                >
+                  <Send size={14} className="text-white" />
+                </button>
+              )}
             </div>
           </div>
         </>

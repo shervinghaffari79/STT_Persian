@@ -1,21 +1,98 @@
 # 🎤 Persian Speech-to-Text Web Application
 
-A modern, responsive web application for converting Persian speech to text. Built with React, Vite, and Tailwind CSS.
+A modern, responsive web app for converting Persian speech to text — now powered by a **fully local, on-device SOTA ASR pipeline** (no cloud API).
+
+## 🧠 The pipeline (backend)
+
+Uploaded audio is transcribed entirely on-device by the best-performing setup from the research phase:
+
+```
+ffmpeg (16 kHz mono)
+   ├─ Silero VAD → ~24s chunks → MLX 8-bit Whisper large-v3 (Persian), GPU (Metal)
+   └─ pyannote 3.1 speaker diarization (neural segmentation + WeSpeaker embeddings)
+   → assign each segment the speaker it overlaps most (WhisperX-style)
+   → Hazm Persian normalization (ZWNJ / spacing / char unification)
+```
+
+> **Speaker diarization** uses `pyannote/speaker-diarization-3.1`, which is
+> **gated**. Accept its terms at <https://hf.co/pyannote/speaker-diarization-3.1>
+> and log in once so the token is cached:
+> `python3 -c "from huggingface_hub import login; login('hf_...')"`.
+> Without a token the backend automatically falls back to a lighter
+> resemblyzer-based diarizer (lower speaker accuracy); transcription is unaffected.
+
+Measured on the two benchmark meeting recordings: **~37–44% WER / ~15–18% CER**
+on spontaneous, multi-speaker, code-switched Persian (best deployable local
+result; the ROVER ensemble + Persian-fair scoring reaches ~36–40% WER offline).
+Runs at roughly real-time on an M2; no data leaves the machine.
 
 ## ✨ Features
 
-- 🎯 **Real-time Speech Recognition** - Convert Persian speech to text instantly
-- 🎚️ **Audio Visualization** - See waveforms as you record using WaveSurfer.js
-- 🎨 **Modern UI** - Beautiful, responsive interface built with Tailwind CSS
-- ⚡ **Fast & Lightweight** - Optimized with Vite for rapid development and production builds
-- 📱 **Fully Responsive** - Works seamlessly on desktop, tablet, and mobile devices
-- 🌙 **Dark Mode Support** - Comfortable viewing in any lighting condition
+- 🎯 **Local Persian ASR** — fine-tuned Whisper large-v3, GPU-accelerated via MLX
+- 🗣️ **Speaker diarization** — automatic speaker separation and labels
+- ⏱️ **Timestamped segments** with per-word timings; export to SRT / TXT / JSON
+- 🤖 **AI analysis panel** — chat over the transcript with a **local Qwen3-4B (MLX)** model (streamed, on-device, no cloud)
+- 🎨 **Modern, responsive dark UI** (React + Tailwind + Vite)
+
+## 🏗️ Architecture
+
+```
+Browser (React/Vite :5173)
+   │  POST /api/transcribe  (multipart upload)
+   │  GET  /api/status/{id} (poll progress)   ── Vite proxy ──▶  FastAPI :8000
+   │                                                              backend/server.py
+   ▼                                                              backend/pipeline.py
+Transcript + speakers rendered in the middle panel
+```
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-- Node.js 16+ installed on your system
-- npm or yarn package manager
+- **Node.js 16+** and npm
+- **Python 3.9+** and **ffmpeg** (`brew install ffmpeg`)
+- Apple Silicon recommended (MLX uses the Metal GPU; falls back to CPU elsewhere)
+- The MLX model at `../models/whisper-large-v3-persian-mlx-q8` (repo root)
+
+### Run everything (backend + frontend)
+
+```bash
+# one-time: install deps
+pip3 install -r backend/requirements.txt
+npm install
+
+# start backend (:8000) AND frontend (:5173) together
+./run.sh
+```
+
+Then open **http://localhost:5173**, drop an audio/`.mp4` file, and click **Transcribe Audio**.
+
+### Or run the two services separately
+
+```bash
+# terminal 1 — backend
+cd backend && python3 server.py         # FastAPI on http://127.0.0.1:8000
+
+# terminal 2 — frontend
+npm run dev                              # Vite on http://localhost:5173
+```
+
+The frontend proxies `/api/*` to the backend (see `vite.config.ts`).
+
+### Backend API
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/transcribe` | multipart `file` (+ `diarize=true\|false`) → `{ job_id }` |
+| `GET` | `/api/status/{job_id}` | `{ state, progress, message, result? }` |
+| `POST` | `/api/chat` | `{ messages, transcript }` → streamed Persian reply (local Qwen3-4B MLX) |
+| `POST` | `/api/chat/title` | `{ transcript }` → `{ title }` |
+| `GET` | `/api/health` | model presence check |
+
+Both the ASR (Whisper) and chat (Qwen3-4B) models run locally via MLX on the
+Apple-Silicon GPU. Nothing is sent to any external API.
+
+---
+
+### Frontend details
 
 ### Installation
 
