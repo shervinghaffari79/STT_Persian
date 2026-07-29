@@ -7,18 +7,27 @@ Best deployable setup from the research/experiments, using the WhisperX-style
 so we get both good WER and good speaker labels:
 
   ffmpeg 16k mono
-    ├─ Silero VAD -> ~24s chunks -> MLX 8-bit Whisper large-v3 (fa) [+ word times]
+    ├─ Silero VAD -> ~24s chunks -> Whisper large-v3 (fa) [+ word times]
     └─ pyannote 3.1 speaker diarization (neural segmentation + WeSpeaker embeds)
   -> assign each word/segment the speaker whose turn it overlaps most
   -> Hazm Persian normalization
+
+The actual Whisper inference is delegated to asr_engine.py, which picks
+between MLX (Apple-Silicon GPU) and CTranslate2/faster-whisper (CUDA/CPU,
+cross-platform) automatically -- see that module for details.
 
 pyannote 3.1 is gated: it needs a Hugging Face token (cached via
 `huggingface_hub login`) with the model's user conditions accepted. If it is
 unavailable, the pipeline degrades to a lightweight resemblyzer clustering and,
 failing that, a single speaker -- transcription still works either way.
+
+An optional `correct_fn(text, speaker, context) -> text` hook (see correct.py)
+can be supplied to lightly clean up each segment's text right after it is
+produced, before it is streamed to the client or included in the final result.
 """
 import os
 import subprocess
+import sys
 import time
 import types
 from collections import defaultdict
@@ -27,11 +36,29 @@ from pathlib import Path
 import numpy as np
 
 SAMPLE_RATE = 16000
-MODEL_DIR = Path(os.environ.get(
-    "MLX_MODEL_DIR",
-    str(Path(__file__).resolve().parents[2] / "models" / "whisper-large-v3-persian-mlx-q8"),
-))
 DIARIZER = os.environ.get("DIARIZER", "pyannote")  # "pyannote" | "resemblyzer" | "off"
+
+
+def model_dir() -> Path:
+    """Best-guess directory of the ASR model that will be used -- mirrors
+    asr_engine's auto-detection but WITHOUT forcing a (possibly heavy) model
+    load, so a health check stays cheap. See asr_engine.py for the real
+    selection used at transcribe time."""
+    import asr_engine
+    requested = os.environ.get("ASR_BACKEND", "auto").lower()
+    if requested in ("mlx", "auto") and asr_engine.MLX_MODEL_DIR.exists():
+        try:
+            import mlx_whisper  # noqa: F401 -- availability probe only
+            return asr_engine.MLX_MODEL_DIR
+        except Exception:
+            pass
+    return asr_engine.CT2_MODEL_DIR
+
+
+def model_available() -> bool:
+    import asr_engine
+    return asr_engine.MLX_MODEL_DIR.exists() or asr_engine.CT2_MODEL_DIR.exists()
+
 
 _ENCODER = None
 _NORMALIZER = None
@@ -44,13 +71,71 @@ def _log(msg, cb=None):
         cb(msg)
 
 
+def _free_gpu():
+    """Hand cached-but-unused GPU blocks back to the driver.
+
+    PyTorch's caching allocator keeps freed memory reserved for reuse, and
+    CTranslate2 (Whisper) allocates OUTSIDE that pool -- so memory pyannote has
+    finished with is not visible to Whisper until this is called. Cheap enough
+    to run between stages."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _unload_pyannote():
+    """Drop the cached diarization pipeline and free its memory.
+
+    Diarization finishes entirely before the ASR loop begins, so on a card that
+    cannot hold both, keeping pyannote resident buys nothing for the current job
+    -- it only saves reload time on the NEXT one. Opt-in via PYANNOTE_UNLOAD=1."""
+    global _PYANNOTE, _PYANNOTE_TRIED
+    if _PYANNOTE is None:
+        return
+    _PYANNOTE = None
+    _PYANNOTE_TRIED = False  # allow a reload on the next job
+    import gc
+    gc.collect()
+    _free_gpu()
+    print("[mem] unloaded pyannote after diarization", file=sys.stderr, flush=True)
+
+
 def decode_audio(path: str) -> np.ndarray:
     """Any audio/video container -> 16 kHz mono float32 via ffmpeg."""
     cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", str(path),
            "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-"]
-    proc = subprocess.run(cmd, capture_output=True)
+    try:
+        # No timeout here previously: a file whose header confuses ffmpeg's
+        # probing (seen with some WAV variants -- an unfinalized RIFF size, an
+        # unusual bit depth/chunk layout) can make it hang rather than exit
+        # non-zero. subprocess.run then blocks forever, the job never reaches
+        # state="error", and the only thing the user sees is the "Processing"
+        # spinner -- indistinguishable from a slow file except that it never
+        # finishes. 10 minutes is generous for decoding alone (no model
+        # inference happens here, this is just a format conversion).
+        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "ffmpeg did not finish decoding this file within 10 minutes. The file's "
+            "container is likely malformed (e.g. an incomplete/streamed recording) "
+            "rather than genuinely large -- decoding itself is fast relative to "
+            "transcription. Try re-exporting or re-recording the file.")
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', 'ignore')[-300:]}")
+    if len(proc.stdout) == 0:
+        # ffmpeg can exit 0 while decoding zero frames -- e.g. a container with a
+        # truncated/corrupted sample-index atom (seen with some phone recordings
+        # interrupted mid-save). Surface this as a real error instead of silently
+        # producing an empty "done" transcription.
+        stderr = proc.stderr.decode("utf-8", "ignore")
+        hint = ""
+        if "truncated" in stderr.lower() or "moov atom not found" in stderr.lower():
+            hint = " The file's internal index looks corrupted/incomplete (interrupted recording or transfer)."
+        raise RuntimeError(f"No audio could be decoded from this file.{hint} ffmpeg said: "
+                          f"{stderr[-300:]}")
     return np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
 
 
@@ -111,25 +196,90 @@ def _load_pyannote():
         from pyannote.audio import Pipeline
         pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
         if pipe is None:
-            return None                       # gated / no accepted token
-        if torch.backends.mps.is_available():
+            # pyannote.audio returns None (no exception) when the model is
+            # gated and no token/accepted-terms is available -- this is the
+            # single most common reason diarization silently degrades to the
+            # weaker resemblyzer fallback, so make it loud.
+            print(
+                "[diarize] pyannote/speaker-diarization-3.1 returned None -- "
+                "this means either no Hugging Face token is configured, or "
+                "the account behind it hasn't accepted the model's terms. "
+                "Fix: run `huggingface-cli login` with a token from "
+                "https://hf.co/settings/tokens, then accept the terms at "
+                "https://hf.co/pyannote/speaker-diarization-3.1 with that "
+                "SAME account. Falling back to resemblyzer diarization "
+                "(lower speaker-separation quality) for now.",
+                file=sys.stderr, flush=True,
+            )
+            return None
+        # PYANNOTE_DEVICE=cpu keeps diarization off the GPU entirely -- slower,
+        # but its memory then comes out of system RAM instead of competing with
+        # Whisper for the card. The escape hatch for files that OOM regardless
+        # of batch size.
+        want = os.environ.get("PYANNOTE_DEVICE", "auto").lower()
+        if want == "cpu":
+            gpu_device = None
+        elif torch.cuda.is_available():
+            gpu_device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            gpu_device = torch.device("mps")
+        else:
+            gpu_device = None
+        if gpu_device is not None:
             try:
-                pipe.to(torch.device("mps"))
-            except Exception:
-                pass
+                pipe.to(gpu_device)
+            except Exception as e:
+                print(f"[diarize] pyannote loaded but failed to move to {gpu_device}: "
+                     f"{type(e).__name__}: {e} -- continuing on CPU", file=sys.stderr, flush=True)
+
+        # Peak diarization memory is set by how many sliding windows pyannote
+        # batches at once, NOT by the model size -- which is why short files are
+        # fine and long ones OOM: a 2h recording produces thousands of windows
+        # and the default batch (32) sizes the activation buffers accordingly.
+        # Lowering it trades a little speed for a footprint that stops growing
+        # with file length. hasattr-guarded because these attribute names differ
+        # between pyannote 3.x and 4.x.
+        batch = int(os.environ.get("PYANNOTE_BATCH", "8"))
+        applied = []
+        for attr in ("segmentation_batch_size", "embedding_batch_size"):
+            if hasattr(pipe, attr):
+                try:
+                    setattr(pipe, attr, batch)
+                    applied.append(attr)
+                except Exception:
+                    pass
+        if applied:
+            print(f"[diarize] batch size {batch} applied to {', '.join(applied)}",
+                  file=sys.stderr, flush=True)
+        print("[diarize] pyannote/speaker-diarization-3.1 loaded successfully "
+             f"(device={gpu_device or 'cpu'})", file=sys.stderr, flush=True)
         _PYANNOTE = pipe
-    except Exception:
+    except Exception as e:
+        print(f"[diarize] pyannote failed to load: {type(e).__name__}: {e} -- "
+             "falling back to resemblyzer diarization", file=sys.stderr, flush=True)
         _PYANNOTE = None
     return _PYANNOTE
 
 
+# def _diarize_pyannote(audio):
+#     import torch
+#     pipe = _load_pyannote()
+#     if pipe is None:
+#         return None
+#     dia = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE})
+#     turns = [(seg.start, seg.end, spk) for seg, _, spk in dia.itertracks(yield_label=True)]
+#     turns.sort(key=lambda t: t[0])
+#     return turns
 def _diarize_pyannote(audio):
     import torch
     pipe = _load_pyannote()
     if pipe is None:
         return None
     dia = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE})
-    turns = [(seg.start, seg.end, spk) for seg, _, spk in dia.itertracks(yield_label=True)]
+    # pyannote 4.x returns a DiarizeOutput object; the turns live under
+    # .speaker_diarization as (turn, speaker) pairs, rather than the old
+    # Annotation.itertracks(yield_label=True) API used in pyannote 3.x.
+    turns = [(turn.start, turn.end, spk) for turn, spk in dia.speaker_diarization]
     turns.sort(key=lambda t: t[0])
     return turns
 
@@ -196,8 +346,9 @@ def _words_from(text, start, end, speaker):
              "text": w, "speaker": speaker} for i, w in enumerate(toks)]
 
 
-def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None) -> dict:
-    import mlx_whisper
+def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
+               correct_fn=None) -> dict:
+    import asr_engine
     t0 = time.time()
     nz = _normalizer()
 
@@ -211,33 +362,55 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None) 
         vad = [{"start": 0, "end": len(audio)}]
     chunks = _asr_chunks(vad)
 
-    # diarization runs independently of the ASR chunking
+    # diarization runs independently of the ASR chunking. `diarizer_used`
+    # tracks what ACTUALLY produced `turns` this run (not inferred from
+    # global state afterwards), so the result's "diarizer" field is accurate
+    # even if pyannote loaded fine earlier but this particular run fell back.
     turns = None
+    diarizer_used = "none"
     if diarize and DIARIZER != "off":
         _log("Identifying speakers…", progress)
-        try:
-            if DIARIZER == "pyannote":
+        if DIARIZER == "pyannote":
+            try:
                 turns = _diarize_pyannote(audio)
-            if turns is None:  # pyannote unavailable -> fallback
+                if turns is not None:
+                    diarizer_used = "pyannote"
+            except Exception as e:
+                print(f"[diarize] pyannote diarization run failed: {type(e).__name__}: {e} -- "
+                     "falling back to resemblyzer diarization", file=sys.stderr, flush=True)
+                turns = None
+        if turns is None and DIARIZER in ("pyannote", "resemblyzer"):
+            # either pyannote was never selected, returned nothing (gated/no
+            # token), or raised above -- try the lighter local fallback
+            try:
                 turns = _diarize_resemblyzer(audio, vad)
-        except Exception:
-            turns = None
+                if turns is not None:
+                    diarizer_used = "resemblyzer"
+            except Exception as e:
+                print(f"[diarize] resemblyzer fallback also failed: {type(e).__name__}: {e} -- "
+                     "continuing with no speaker separation", file=sys.stderr, flush=True)
+                turns = None
+        print(f"[diarize] this run used: {diarizer_used}", file=sys.stderr, flush=True)
+        # Diarization is done with the GPU from here on -- the ASR loop below is
+        # the only consumer left. Release what it was holding before Whisper
+        # starts allocating, otherwise the two peaks overlap for no reason.
+        if os.environ.get("PYANNOTE_UNLOAD", "0") == "1":
+            _unload_pyannote()
+        else:
+            _free_gpu()
 
     # transcribe chunk-by-chunk, assigning the speaker (by overlap) and emitting
     # each finished segment immediately so the UI can stream the transcript.
     label_map, segments = {}, []
+    recent_context = []  # last few corrected "Sx: text" lines, for correct_fn context
     n = len(chunks)
     for i, (a, b) in enumerate(chunks):
         _log(f"Transcribing {i+1}/{n}…", progress)
         if b - a < int(0.1 * SAMPLE_RATE):
             continue
-        r = mlx_whisper.transcribe(
-            audio[a:b], path_or_hf_repo=str(MODEL_DIR), language="fa", task="transcribe",
-            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0), compression_ratio_threshold=2.4,
-            no_speech_threshold=0.45, condition_on_previous_text=False,
-            word_timestamps=False, verbose=None)
+        chunk_segments = asr_engine.transcribe_chunk(audio[a:b], SAMPLE_RATE)
         off = a / SAMPLE_RATE
-        for s in r.get("segments", []):
+        for s in chunk_segments:
             raw = s["text"].strip()
             if not raw:
                 continue
@@ -247,9 +420,19 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None) 
                 label_map[spk_raw] = f"S{len(label_map)+1}"
             spk = label_map[spk_raw]
             text = nz.normalize(raw)
-            seg = {"speaker": spk, "start": st, "end": en,
-                   "text": text, "words": _words_from(text, st, en, spk)}
+            if correct_fn:
+                # optional per-segment GPT cleanup, applied before the segment
+                # is ever surfaced (streamed or in the final result). Pass a
+                # short rolling context of prior corrected segments so the
+                # model has enough grounding to resolve ambiguous words
+                # instead of defaulting to "[نامفهوم]" for lack of context.
+                context = "\n".join(recent_context[-4:])
+                text = correct_fn(text, spk, context)
+            seg = {"speaker": spk, "start": st, "end": en, "text": text,
+                   "words": _words_from(text, st, en, spk), "confidence": s.get("confidence")}
             segments.append(seg)
+            if text:
+                recent_context.append(f"{spk}: {text}")
             if on_segment:
                 on_segment(seg)
 
@@ -263,6 +446,5 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None) 
         "rawText": raw_text,
         "speakers": speakers,
         "processingTime": round(time.time() - t0, 1),
-        "diarizer": ("pyannote" if turns and DIARIZER == "pyannote" and _PYANNOTE
-                     else ("resemblyzer" if turns else "none")),
+        "diarizer": diarizer_used,
     }

@@ -1,9 +1,28 @@
 import { useState, useRef, useEffect } from 'react';
 import {
-  FileText, Download, Copy, Check, Search, Filter,
+  FileText, Download, Copy, Check, X, Search, Filter,
   Users, Clock, MessageSquare, AlignLeft,
 } from 'lucide-react';
 import { TranscriptionResult } from '../types';
+import { copyText } from '../utils/clipboard';
+
+// exp(avg_logprob) thresholds for the low/mid/high confidence dot -- these
+// are not calibrated probabilities (see asr_engine._confidence), just rough
+// bands tuned by eye against fine-tuned Persian Whisper's typical output
+// range, where >0.85 is ordinary and <0.6 usually means genuine trouble
+// (cross-talk, noise, an unfamiliar word).
+function confidenceBand(c: number | null | undefined): 'high' | 'mid' | 'low' | null {
+  if (c == null) return null;
+  if (c >= 0.85) return 'high';
+  if (c >= 0.6) return 'mid';
+  return 'low';
+}
+
+const CONFIDENCE_DOT: Record<'high' | 'mid' | 'low', string> = {
+  high: 'bg-green-500',
+  mid: 'bg-amber-500',
+  low: 'bg-red-500',
+};
 
 interface TranscriptPanelProps {
   transcription: TranscriptionResult | null;
@@ -36,6 +55,7 @@ export default function TranscriptPanel({
   const [searchQuery, setSearchQuery] = useState('');
   const [filterSpeaker, setFilterSpeaker] = useState<string>('all');
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showFilterMenu, setShowFilterMenu] = useState(false);
   const activeSegmentRef = useRef<HTMLDivElement>(null);
@@ -81,12 +101,31 @@ export default function TranscriptPanel({
     );
   };
 
-  const handleCopy = () => {
+  const handleCopy = async () => {
     if (!transcription) return;
-    navigator.clipboard.writeText(transcription.rawText);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    const ok = await copyText(transcription.rawText);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } else {
+      setCopyFailed(true);
+      setTimeout(() => setCopyFailed(false), 2500);
+    }
   };
+
+  // Group consecutive same-speaker segments into one paragraph. Without this,
+  // "text" view space-joins every VAD-derived ~24s chunk in a row regardless
+  // of speaker, which reads as a single undifferentiated wall of text with no
+  // paragraph or speaker structure at all.
+  const paragraphs = (() => {
+    const groups: { speaker: string; text: string }[] = [];
+    for (const seg of filteredSegments) {
+      const last = groups[groups.length - 1];
+      if (last && last.speaker === seg.speaker) last.text += ' ' + seg.text;
+      else groups.push({ speaker: seg.speaker, text: seg.text });
+    }
+    return groups;
+  })();
 
   const handleExport = (format: ExportFormat) => {
     if (!transcription) return;
@@ -183,9 +222,13 @@ export default function TranscriptPanel({
           <button
             onClick={handleCopy}
             className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-white/5 text-gray-400 hover:text-white transition-colors"
-            title="Copy transcript"
+            title={copyFailed ? 'Copy failed -- clipboard unavailable' : 'Copy transcript'}
           >
-            {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+            {copied
+              ? <Check size={14} className="text-green-400" />
+              : copyFailed
+              ? <X size={14} className="text-red-400" />
+              : <Copy size={14} />}
           </button>
           {/* Export */}
           <div className="relative">
@@ -314,6 +357,7 @@ export default function TranscriptPanel({
             {filteredSegments.map((seg, idx) => {
               const colors = getSpeakerColor(seg.speaker);
               const isActive = activeSegmentIndex >= 0 && transcription.segments[activeSegmentIndex] === seg;
+              const band = confidenceBand(seg.confidence);
               return (
                 <div
                   key={idx}
@@ -329,6 +373,14 @@ export default function TranscriptPanel({
                       <span className={`text-[11px] font-semibold ${colors.text}`}>Speaker {seg.speaker}</span>
                     </div>
                     <span className="text-[11px] text-gray-600">{formatTime(seg.start)} – {formatTime(seg.end)}</span>
+                    {band && (
+                      <div
+                        className={`w-1.5 h-1.5 rounded-full ${CONFIDENCE_DOT[band]}`}
+                        title={`ASR confidence: ${Math.round((seg.confidence ?? 0) * 100)}%${
+                          band === 'low' ? ' -- worth double-checking against the audio' : ''
+                        }`}
+                      />
+                    )}
                     {isActive && (
                       <div className="flex gap-0.5 items-end h-3 ml-auto">
                         {[1, 2, 3].map(i => (
@@ -349,10 +401,16 @@ export default function TranscriptPanel({
         )}
 
         {viewMode === 'text' && (
-          <div className="prose max-w-none">
-            <p className="text-sm text-gray-200 leading-loose whitespace-pre-wrap text-right" dir="rtl">
-              {filteredSegments.map(seg => seg.text).join(' ')}
-            </p>
+          <div className="prose max-w-none space-y-3">
+            {paragraphs.map((p, idx) => {
+              const colors = getSpeakerColor(p.speaker);
+              return (
+                <p key={idx} className="text-sm text-gray-200 leading-loose whitespace-pre-wrap text-right" dir="rtl">
+                  <span className={`text-[11px] font-semibold ${colors.text} ml-1.5`}>{p.speaker}:</span>
+                  {p.text}
+                </p>
+              );
+            })}
           </div>
         )}
 

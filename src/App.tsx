@@ -151,6 +151,7 @@ export default function App() {
             transcription={transcription}
             externalMessage={externalChatMessage}
             onExternalMessageUsed={handleExternalMessageUsed}
+            onSeek={handleSeek}
           />
         </div>
       </main>

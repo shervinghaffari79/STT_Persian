@@ -6,18 +6,42 @@ import {
 } from 'lucide-react';
 import { ChatMessage, ChatSession, TranscriptionResult } from '../types';
 import { streamChatCompletion, generateTitle } from '../services/localChat';
+import { copyText } from '../utils/clipboard';
 import Markdown from './Markdown';
 
 interface ChatPanelProps {
   transcription: TranscriptionResult | null;
   externalMessage?: string;
   onExternalMessageUsed: () => void;
+  /** Seek the audio/transcript to a point cited in an AI response, e.g.
+   * "[04:12]" -- see Markdown.tsx's citation handling. Optional so this panel
+   * still works (citations just render inert) if no player is wired up. */
+  onSeek?: (time: number) => void;
 }
 
 type RightPanelView = 'chat' | 'history';
 
 function generateId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function formatTimestamp(t: number): string {
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60).toString().padStart(2, '0');
+  const s = Math.floor(t % 60).toString().padStart(2, '0');
+  return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+}
+
+// Per-segment timestamps so the model can cite a specific moment back at the
+// user -- transcription.rawText (used for copy/export) deliberately omits
+// these to stay a clean plain-text transcript, so this is a separate,
+// chat-only view of the same segments. chat.py's system prompt instructs the
+// model to cite in exactly this [MM:SS] bracket form; Markdown.tsx's
+// citation regex is what makes a cited timestamp clickable in the reply.
+function buildChatTranscript(transcription: TranscriptionResult): string {
+  return transcription.segments
+    .map(seg => `[${seg.speaker} ${formatTimestamp(seg.start)}]: ${seg.text}`)
+    .join('\n\n');
 }
 
 const SUGGESTED_PROMPTS = [
@@ -33,6 +57,7 @@ export default function ChatPanel({
   transcription,
   externalMessage,
   onExternalMessageUsed,
+  onSeek,
 }: ChatPanelProps) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -40,6 +65,7 @@ export default function ChatPanel({
   const [isStreaming, setIsStreaming] = useState(false);
   const [view, setView] = useState<RightPanelView>('chat');
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
+  const [copyErrorMsgId, setCopyErrorMsgId] = useState<string | null>(null);
   const [historySearch, setHistorySearch] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
@@ -106,7 +132,7 @@ export default function ChatPanel({
 
     await streamChatCompletion(
       history,
-      transcription?.rawText || '',
+      transcription ? buildChatTranscript(transcription) : '',
       (token) => {
         setSessions(prev => prev.map(s =>
           s.id === sessionId
@@ -205,10 +231,15 @@ export default function ChatPanel({
     }
   };
 
-  const copyMessage = (id: string, content: string) => {
-    navigator.clipboard.writeText(content);
-    setCopiedMsgId(id);
-    setTimeout(() => setCopiedMsgId(null), 2000);
+  const copyMessage = async (id: string, content: string) => {
+    const ok = await copyText(content);
+    if (ok) {
+      setCopiedMsgId(id);
+      setTimeout(() => setCopiedMsgId(null), 2000);
+    } else {
+      setCopyErrorMsgId(id);
+      setTimeout(() => setCopyErrorMsgId(null), 2500);
+    }
   };
 
   const formatTime = (d: Date) => {
@@ -416,7 +447,7 @@ export default function ChatPanel({
                             </div>
                           ) : msg.role === 'assistant' ? (
                             <div className={msg.isStreaming ? 'typing-cursor' : ''}>
-                              <Markdown content={msg.content} />
+                              <Markdown content={msg.content} onCite={onSeek} />
                             </div>
                           ) : (
                             <div className="whitespace-pre-wrap text-right" dir="auto">{msg.content}</div>
@@ -436,9 +467,12 @@ export default function ChatPanel({
                           )}
                           {msg.role === 'assistant' && !msg.isStreaming && (
                             <button onClick={() => copyMessage(msg.id, msg.content)}
-                              className="text-gray-500 hover:text-gray-300 transition-colors" title="کپی">
+                              className="text-gray-500 hover:text-gray-300 transition-colors"
+                              title={copyErrorMsgId === msg.id ? 'کپی ناموفق بود -- کلیپ‌بورد در دسترس نیست' : 'کپی'}>
                               {copiedMsgId === msg.id
                                 ? <Check size={11} className="text-green-400" />
+                                : copyErrorMsgId === msg.id
+                                ? <X size={11} className="text-red-400" />
                                 : <Copy size={11} />}
                             </button>
                           )}

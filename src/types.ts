@@ -11,6 +11,10 @@ export interface TranscriptSegment {
   end: number;
   text: string;
   words: TranscriptWord[];
+  /** exp(avg_logprob) from the ASR backend, 0..1. Not a calibrated
+   * probability -- a relative signal for which segments the model was least
+   * sure about. Undefined for older results computed before this existed. */
+  confidence?: number | null;
 }
 
 export interface TranscriptionResult {
