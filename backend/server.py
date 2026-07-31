@@ -131,8 +131,12 @@ def diarizer_status():
     the backend's console/log either way."""
     pipe = pipeline._load_pyannote()
     if pipe is not None:
+        exclusive = hasattr(pipe, "exclusive_speaker_diarization") or \
+            pipeline._PYANNOTE_ID.endswith("community-1")
         return {"pyannote_available": True,
-                "detail": "pyannote/speaker-diarization-3.1 loaded successfully; "
+                "pipeline": pipeline._PYANNOTE_ID,
+                "exclusive_diarization": bool(exclusive and pipeline.PYANNOTE_EXCLUSIVE),
+                "detail": f"{pipeline._PYANNOTE_ID} loaded successfully; "
                           "transcriptions will use it for diarization."}
     return {"pyannote_available": False,
             "detail": "pyannote failed to load or is gated (see the backend console for the "

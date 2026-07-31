@@ -198,9 +198,64 @@ it from being hit directly.
   slower, but fully functional (this was benchmarked at roughly real-time to
   2x real-time for ASR on CPU earlier in this project).
 - **pyannote diarization** needs a Hugging Face token with the model's terms
-  accepted (`huggingface-cli login`, then visit
-  https://hf.co/pyannote/speaker-diarization-3.1 and accept). Without it, the
-  backend falls back to a lighter local speaker-clustering method automatically.
+  accepted (`huggingface-cli login`, then accept the terms). The backend tries
+  `speaker-diarization-community-1` first and falls back to `speaker-diarization-3.1`,
+  then to a lighter local clustering method. **Terms are accepted per model**, so
+  accept both:
+  <https://hf.co/pyannote/speaker-diarization-community-1> and
+  <https://hf.co/pyannote/speaker-diarization-3.1>.
+  Check which one is actually live with `GET /api/diarizer-status`.
+
+### Diarization tuning
+
+`community-1` (pyannote.audio 4.x) is preferred because it beats 3.1 on 10 of
+12 published benchmarks — for meeting audio the relevant ones are AMI-SDM
+(22.7 → 19.9 DER) and AliMeeting (24.5 → 20.3). It replaces 3.1's
+agglomerative clustering with VBx + PLDA, which specifically reduces *speaker
+confusion*. It also emits an **exclusive** diarization (one speaker at any
+instant) that the pipeline uses by default to align words to speakers —
+without it, a word inside overlapped speech is labelled by whichever
+overlapping turn covers it more, which is what splits one person's sentence
+across two speaker labels.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `PYANNOTE_PIPELINE` | *(auto)* | Pin one pipeline instead of trying community-1 → 3.1 |
+| `PYANNOTE_EXCLUSIVE` | `1` | Use exclusive diarization when available (`0` = allow overlaps) |
+| `PYANNOTE_BATCH` | `32` | Windows per forward pass. Upstream default; lower only if a long file OOMs |
+| `PYANNOTE_NUM_SPEAKERS` | *(unset)* | Exact headcount — the single biggest accuracy lever when known |
+| `PYANNOTE_MIN_SPEAKERS` / `PYANNOTE_MAX_SPEAKERS` | *(unset)* | Bound the headcount when the exact number isn't known |
+| `PYANNOTE_THRESHOLD` | *(model default)* | Clustering threshold; **lower ⇒ more distinct speakers** |
+| `PYANNOTE_MIN_CLUSTER_SIZE` | *(model default)* | 3.1 only (community-1's VBx has no such knob; it is ignored with a log line) |
+| `PYANNOTE_UNLOAD` | `0` | Free pyannote's VRAM before the ASR loop starts |
+| `PYANNOTE_DEVICE` | `auto` | `cpu` keeps diarization off the GPU entirely |
+
+If speakers are still being merged, set `PYANNOTE_NUM_SPEAKERS` when you know
+the headcount — it tells clustering the answer instead of asking it to infer
+one, and outperforms any threshold tuning.
+
+### ASR speed/accuracy knobs
+
+Decode cost is dominated by beam width and by the temperature-fallback ladder:
+when a decode trips `compression_ratio_threshold` (repetitive output) Whisper
+**re-decodes the same audio** at the next temperature, up to 6 times. The
+backend now logs `[asr] temperature fallback fired …` whenever that happens —
+check for it before trading accuracy for speed.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `WHISPER_BEAM_SIZE` | `5` | `1` (greedy) is the largest single ASR speedup, at some WER cost |
+| `WHISPER_TEMPERATURES` | `0.0,0.2,0.4,0.6,0.8,1.0` | Shorten to cap worst-case re-decoding |
+| `DIARIZE_WORD_LEVEL` | `1` | `0` skips Whisper's word-alignment pass (~10–20% faster, coarser speaker splits) |
+| `DEDUPE_THRESHOLD` | `0.6` | Similarity above which an adjacent repeated segment is dropped |
+| `CT2_COMPUTE_TYPE` | `int8_float16` on CUDA | Override the compute type |
+
+> **torchcodec on Windows:** pyannote.audio 4.x dropped the `soundfile`/`sox`
+> audio backends, so it decodes via torchcodec. If the log shows
+> `Could not load libtorchcodec`, torchcodec doesn't match your torch build —
+> install the matching version ([compatibility table](https://github.com/pytorch/torchcodec#installing-torchcodec)).
+> This pipeline feeds pyannote an in-memory waveform, so diarization still
+> works, but any file-path code path in pyannote will not.
 - **`gpt_correct`** (per-segment GPT cleanup) is fully cross-platform already —
   it just calls the OpenAI API — set `OPENAI_API_KEY` as an environment variable.
 

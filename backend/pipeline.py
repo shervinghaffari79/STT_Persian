@@ -25,6 +25,7 @@ An optional `correct_fn(text, speaker, context) -> text` hook (see correct.py)
 can be supplied to lightly clean up each segment's text right after it is
 produced, before it is streamed to the client or included in the final result.
 """
+import bisect
 import difflib
 import os
 import subprocess
@@ -38,6 +39,29 @@ import numpy as np
 
 SAMPLE_RATE = 16000
 DIARIZER = os.environ.get("DIARIZER", "pyannote")  # "pyannote" | "resemblyzer" | "off"
+
+# Diarization pipeline, best first. community-1 (pyannote.audio 4.x, Sept 2025)
+# beats the legacy 3.1 on 10 of 12 published benchmarks -- most relevantly for
+# meeting audio recorded over a laptop mic: AMI-SDM 22.7 -> 19.9 DER and
+# AliMeeting 24.5 -> 20.3. It ties on VoxConverse and is slightly worse on
+# REPERE (7.9 -> 8.9). The win comes from swapping AgglomerativeClustering for
+# VBx (Bayesian HMM over x-vectors) + PLDA, which is specifically a
+# speaker-CONFUSION fix -- the failure mode this pipeline actually hits.
+# Both are gated, and terms must be accepted PER MODEL, so community-1 falling
+# through to 3.1 is expected until that is done -- hence a list, not a swap.
+# Pin one explicitly with PYANNOTE_PIPELINE.
+PYANNOTE_PIPELINES = ["pyannote/speaker-diarization-community-1",
+                      "pyannote/speaker-diarization-3.1"]
+
+# community-1 additionally emits an "exclusive" diarization in which at most
+# one speaker is active at any instant. Regular diarization marks overlapped
+# speech as BOTH speakers at once, so a word landing in an overlap region gets
+# its label from whichever turn happens to overlap it more -- effectively a
+# coin flip mid-sentence, which is what shreds a turn across two speakers.
+# pyannote ships this specifically to reconcile diarization with ASR word
+# timestamps, which is exactly what _split_on_speaker does. Off => use the
+# regular (overlap-preserving) diarization.
+PYANNOTE_EXCLUSIVE = os.environ.get("PYANNOTE_EXCLUSIVE", "1") != "0"
 
 # Word-level speaker assignment needs word timestamps, which cost a second
 # alignment pass inside Whisper (cross-attention + DTW, per segment, on top of
@@ -91,6 +115,7 @@ def asr_diagnostic() -> dict:
 _ENCODER = None
 _NORMALIZER = None
 _PYANNOTE = None
+_PYANNOTE_ID = None      # which pipeline id actually loaded, for reporting
 _PYANNOTE_TRIED = False
 
 
@@ -258,8 +283,18 @@ def _pyannote_overrides(pipe) -> dict:
         clustering["threshold"] = float(os.environ["PYANNOTE_THRESHOLD"])
         changed = True
     if os.environ.get("PYANNOTE_MIN_CLUSTER_SIZE"):
-        clustering["min_cluster_size"] = int(os.environ["PYANNOTE_MIN_CLUSTER_SIZE"])
-        changed = True
+        # Only AgglomerativeClustering (3.1) has min_cluster_size. community-1
+        # clusters with VBx, whose knobs are threshold/Fa/Fb -- injecting a key
+        # its parameter tree doesn't define makes instantiate() raise, which
+        # would silently drop the threshold override sitting next to it too.
+        if "min_cluster_size" in clustering:
+            clustering["min_cluster_size"] = int(os.environ["PYANNOTE_MIN_CLUSTER_SIZE"])
+            changed = True
+        else:
+            print("[diarize] PYANNOTE_MIN_CLUSTER_SIZE ignored: this pipeline's "
+                 f"clustering has no such parameter (has: {sorted(clustering)}). "
+                 "It applies to speaker-diarization-3.1's AgglomerativeClustering, "
+                 "not community-1's VBx.", file=sys.stderr, flush=True)
     if changed:
         overrides["clustering"] = clustering
 
@@ -273,7 +308,7 @@ def _pyannote_overrides(pipe) -> dict:
 
 def _load_pyannote():
     """Load pyannote 3.1, applying the torch-2.8 / speechbrain-1.1 compat patches."""
-    global _PYANNOTE, _PYANNOTE_TRIED
+    global _PYANNOTE, _PYANNOTE_ID, _PYANNOTE_TRIED
     if _PYANNOTE is not None or _PYANNOTE_TRIED:
         return _PYANNOTE
     _PYANNOTE_TRIED = True
@@ -298,24 +333,40 @@ def _load_pyannote():
         _orig_load = torch.load  # pyannote ckpt is trusted; allow full unpickle on torch>=2.6
         torch.load = lambda *a, **k: _orig_load(*a, **{**k, "weights_only": False})
         from pyannote.audio import Pipeline
-        pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-        if pipe is None:
+        explicit = os.environ.get("PYANNOTE_PIPELINE")
+        candidates = [explicit] if explicit else list(PYANNOTE_PIPELINES)
+        pipe, loaded_id, tried = None, None, []
+        for model_id in candidates:
+            try:
+                pipe = Pipeline.from_pretrained(model_id)
+            except Exception as e:
+                tried.append(f"  {model_id}: {type(e).__name__}: {e}")
+                pipe = None
+                continue
+            if pipe is not None:
+                loaded_id = model_id
+                break
             # pyannote.audio returns None (no exception) when the model is
             # gated and no token/accepted-terms is available -- this is the
             # single most common reason diarization silently degrades to the
             # weaker resemblyzer fallback, so make it loud.
-            print(
-                "[diarize] pyannote/speaker-diarization-3.1 returned None -- "
-                "this means either no Hugging Face token is configured, or "
-                "the account behind it hasn't accepted the model's terms. "
-                "Fix: run `huggingface-cli login` with a token from "
-                "https://hf.co/settings/tokens, then accept the terms at "
-                "https://hf.co/pyannote/speaker-diarization-3.1 with that "
-                "SAME account. Falling back to resemblyzer diarization "
-                "(lower speaker-separation quality) for now.",
-                file=sys.stderr, flush=True,
-            )
+            tried.append(f"  {model_id}: gated -- no HF token, or its terms "
+                        f"not accepted by that token's account "
+                        f"(accept at https://hf.co/{model_id})")
+        if pipe is None:
+            print("[diarize] no pyannote pipeline could be loaded:\n"
+                 + "\n".join(tried) +
+                 "\nFix: run `huggingface-cli login` with a token from "
+                 "https://hf.co/settings/tokens, then accept the terms for the "
+                 "model above with that SAME account. Falling back to "
+                 "resemblyzer diarization (lower speaker-separation quality).",
+                 file=sys.stderr, flush=True)
             return None
+        if tried:
+            # a better pipeline was available in the list but unusable -- say so,
+            # otherwise the quality difference silently looks like a code problem
+            print(f"[diarize] preferred pipeline(s) unavailable, fell back to "
+                 f"{loaded_id}:\n" + "\n".join(tried), file=sys.stderr, flush=True)
 
         overrides = _pyannote_overrides(pipe)
         if overrides:
@@ -349,11 +400,22 @@ def _load_pyannote():
         # Peak diarization memory is set by how many sliding windows pyannote
         # batches at once, NOT by the model size -- which is why short files are
         # fine and long ones OOM: a 2h recording produces thousands of windows
-        # and the default batch (32) sizes the activation buffers accordingly.
-        # Lowering it trades a little speed for a footprint that stops growing
-        # with file length. hasattr-guarded because these attribute names differ
-        # between pyannote 3.x and 4.x.
-        batch = int(os.environ.get("PYANNOTE_BATCH", "8"))
+        # and the batch size sizes the activation buffers accordingly.
+        # Lowering it trades speed for a footprint that stops growing with file
+        # length. hasattr-guarded because these attribute names differ between
+        # pyannote 3.x and 4.x.
+        #
+        # 32 is what BOTH speaker-diarization-3.1 and community-1 ship in their
+        # own config.yaml. This used to default to 8 -- a 4x cut in windows per
+        # forward pass, i.e. 4x the number of GPU round-trips, and diarization
+        # runs a 10s window at a 1s step, so the window count is ~10x the audio
+        # duration in seconds and that multiplier lands on the whole file. It
+        # was set to 8 to stop CUDA OOM back when the ~8GB fp16 chat model
+        # stayed resident for the process lifetime; server.py now unloads chat
+        # before every transcription, so the constraint that justified it is
+        # gone and this is just a self-inflicted slowdown. Drop it back to 8 if
+        # a very long file still OOMs on a smaller card.
+        batch = int(os.environ.get("PYANNOTE_BATCH", "32"))
         applied = []
         for attr in ("segmentation_batch_size", "embedding_batch_size"):
             if hasattr(pipe, attr):
@@ -365,9 +427,10 @@ def _load_pyannote():
         if applied:
             print(f"[diarize] batch size {batch} applied to {', '.join(applied)}",
                   file=sys.stderr, flush=True)
-        print("[diarize] pyannote/speaker-diarization-3.1 loaded successfully "
+        print(f"[diarize] {loaded_id} loaded successfully "
              f"(device={gpu_device or 'cpu'})", file=sys.stderr, flush=True)
         _PYANNOTE = pipe
+        _PYANNOTE_ID = loaded_id
     except Exception as e:
         print(f"[diarize] pyannote failed to load: {type(e).__name__}: {e} -- "
              "falling back to resemblyzer diarization", file=sys.stderr, flush=True)
@@ -384,6 +447,22 @@ def _load_pyannote():
 #     turns = [(seg.start, seg.end, spk) for seg, _, spk in dia.itertracks(yield_label=True)]
 #     turns.sort(key=lambda t: t[0])
 #     return turns
+def _turns_from(ann):
+    """(start, end, speaker) triples from either pyannote annotation shape.
+
+    3.x exposes Annotation.itertracks(yield_label=True) -> (segment, track,
+    label); 4.x's annotations iterate directly as (turn, speaker) pairs. The
+    previous code hardcoded the 4.x pair form, so it would raise on a 3.x
+    install -- and pinning back to 3.x is a live option for this project."""
+    it = getattr(ann, "itertracks", None)
+    if it is not None:
+        try:
+            return [(seg.start, seg.end, spk) for seg, _, spk in it(yield_label=True)]
+        except Exception:
+            pass
+    return [(turn.start, turn.end, spk) for turn, spk in ann]
+
+
 def _diarize_pyannote(audio):
     import torch
     pipe = _load_pyannote()
@@ -406,10 +485,23 @@ def _diarize_pyannote(audio):
 
     dia = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE},
                **kwargs)
-    # pyannote 4.x returns a DiarizeOutput object; the turns live under
-    # .speaker_diarization as (turn, speaker) pairs, rather than the old
-    # Annotation.itertracks(yield_label=True) API used in pyannote 3.x.
-    turns = [(turn.start, turn.end, spk) for turn, spk in dia.speaker_diarization]
+
+    # pyannote 4.x returns a DiarizeOutput carrying one or two annotations;
+    # 3.x returns a bare Annotation. Prefer the EXCLUSIVE annotation when the
+    # pipeline provides one (community-1 only): in the regular annotation,
+    # overlapped speech is emitted as two simultaneous turns, so a word inside
+    # an overlap is labelled by whichever of them happens to overlap it more --
+    # a near-coin-flip that splits one person's sentence across two speakers.
+    # The exclusive annotation resolves overlaps to a single speaker per
+    # instant, which is precisely the reconciliation _split_on_speaker needs.
+    source, ann = "speaker_diarization", getattr(dia, "speaker_diarization", dia)
+    if PYANNOTE_EXCLUSIVE:
+        excl = getattr(dia, "exclusive_speaker_diarization", None)
+        if excl is not None:
+            source, ann = "exclusive_speaker_diarization", excl
+    print(f"[diarize] using {source}", file=sys.stderr, flush=True)
+
+    turns = _turns_from(ann)
     turns.sort(key=lambda t: t[0])
     return turns
 
@@ -438,20 +530,77 @@ def _diarize_resemblyzer(audio, segs):
             for s, l in zip(segs, labels)]
 
 
+class _TurnIndex:
+    """Diarization turns indexed for overlap queries.
+
+    _assign_speaker is called once per WORD and used to scan every turn, so
+    cost grew as words x turns -- both proportional to duration, making it
+    quadratic in file length. Measured here: ~3.6s of pure Python for a 1h
+    recording, ~14.5s for a 2h one. That is not what makes a job slow, but it
+    is wasted wall-clock that grows the wrong way, and the fix is small.
+
+    Turns sorted by start, plus a running max-end, bound the scan on both
+    sides: nothing starting after the query window can overlap it, and no turn
+    whose running max-end is still below the window's start can reach it.
+    Because that running max-end is non-decreasing by construction, BOTH
+    bounds are binary-searchable, so the kept range is scanned in ascending
+    order -- which matters: max() and min() below return the FIRST extreme
+    they see, so visiting turns in a different order silently changes the
+    winner whenever two speakers overlap a word equally. Ties like that are
+    common at a turn boundary, which is exactly where accuracy matters most.
+    The original turn order is kept for the same reason.
+
+    Results are identical to the linear scan this replaces -- verified against
+    it on randomized overlapping-turn inputs, ties included."""
+    __slots__ = ("turns", "_starts", "_maxend", "_sorted", "_pos")
+
+    def __init__(self, turns):
+        # keep the caller's order: it is what the linear scan saw, and it
+        # decides ties in both the max() and the min() below
+        self.turns = list(turns)
+        order = sorted(range(len(self.turns)), key=lambda i: self.turns[i][0])
+        self._sorted = [self.turns[i] for i in order]
+        self._pos = order              # sorted slot -> original index
+        self._starts = [t[0] for t in self._sorted]
+        self._maxend, m = [], float("-inf")
+        for _s, e, _spk in self._sorted:
+            m = e if e > m else m
+            self._maxend.append(m)
+
+    def __len__(self):
+        return len(self.turns)
+
+    def assign(self, seg_start, seg_end):
+        if not self.turns:
+            return None
+        # hi: last turn that starts at or before the window ends.
+        # lo: first turn whose running max-end reaches past the window start.
+        hi = bisect.bisect_right(self._starts, seg_end) - 1
+        lo = bisect.bisect_right(self._maxend, seg_start)
+        overlap = defaultdict(float)
+        # Accumulate in ORIGINAL turn order, not sorted order, so the dict's
+        # insertion order -- and therefore max()'s first-wins tie-break -- is
+        # the one the linear scan produced. Candidates per query are few (the
+        # turns touching one word), so the sort here is over a handful of items.
+        for i in sorted(range(lo, hi + 1), key=self._pos.__getitem__):
+            ts, te, spk = self._sorted[i]
+            ov = min(seg_end, te) - max(seg_start, ts)
+            if ov > 0:
+                overlap[spk] += ov
+        if not overlap:
+            # no overlap (short gap) -> nearest turn by midpoint
+            mid = (seg_start + seg_end) / 2
+            return min(self.turns, key=lambda t: abs((t[0] + t[1]) / 2 - mid))[2]
+        return max(overlap.items(), key=lambda kv: kv[1])[0]
+
+
 def _assign_speaker(seg_start, seg_end, turns):
     """Speaker whose diarization turns overlap this segment the most."""
     if not turns:
         return None
-    overlap = defaultdict(float)
-    for ts, te, spk in turns:
-        ov = min(seg_end, te) - max(seg_start, ts)
-        if ov > 0:
-            overlap[spk] += ov
-    if not overlap:
-        # no overlap (short gap) -> nearest turn by midpoint
-        mid = (seg_start + seg_end) / 2
-        return min(turns, key=lambda t: abs((t[0] + t[1]) / 2 - mid))[2]
-    return max(overlap.items(), key=lambda kv: kv[1])[0]
+    if isinstance(turns, _TurnIndex):
+        return turns.assign(seg_start, seg_end)
+    return _TurnIndex(turns).assign(seg_start, seg_end)
 
 
 # ── text + output helpers ──────────────────────────────────────────────────
@@ -668,7 +817,12 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
                 print(f"[diarize] resemblyzer fallback also failed: {type(e).__name__}: {e} -- "
                      "continuing with no speaker separation", file=sys.stderr, flush=True)
                 turns = None
-        print(f"[diarize] this run used: {diarizer_used}", file=sys.stderr, flush=True)
+        # build the overlap index ONCE per job rather than rescanning the raw
+        # turn list for every word (see _TurnIndex)
+        if turns:
+            turns = _TurnIndex(turns)
+        print(f"[diarize] this run used: {diarizer_used} "
+             f"({len(turns) if turns else 0} turns)", file=sys.stderr, flush=True)
         # Diarization is done with the GPU from here on -- the ASR loop below is
         # the only consumer left. Release what it was holding before Whisper
         # starts allocating, otherwise the two peaks overlap for no reason.

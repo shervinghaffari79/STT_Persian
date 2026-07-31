@@ -27,6 +27,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 MLX_MODEL_DIR = Path(os.environ.get("MLX_MODEL_DIR", str(_REPO_ROOT / "models" / "whisper-large-v3-persian-mlx-q8")))
 CT2_MODEL_DIR = Path(os.environ.get("CT2_MODEL_DIR", str(_REPO_ROOT / "models" / "whisper-large-v3-persian-ct2-int8")))
 
+# Beam search width. 5 is Whisper's default and what this model was evaluated
+# at; decode cost scales roughly with it, so WHISPER_BEAM_SIZE=1 (greedy) is
+# the largest single ASR speedup available here, at some accuracy cost. Left at
+# 5 so speed is never traded for WER without someone choosing to.
+BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
+
 _ct2_model = None
 _active = None  # "mlx" | "ctranslate2", set on first use
 # Diagnostic snapshot of what _select() actually decided and why -- see
@@ -123,6 +129,39 @@ def backend_info() -> dict:
     return {"loaded": True, **_device_info}
 
 
+def _temperatures():
+    """Whisper's temperature-fallback ladder.
+
+    When a decode trips compression_ratio_threshold (i.e. its output is
+    suspiciously repetitive) or the logprob threshold, Whisper RE-DECODES the
+    same audio at the next temperature up. Six entries therefore means one
+    pathological chunk can be decoded six times over -- and repetitive output
+    is exactly what this project's audio produces, so the chunks that
+    hallucinate repeats are also the ones burning the most GPU time. The two
+    reported symptoms (duplicate text, slow processing) are the same event
+    seen from two sides.
+
+    Shortening the ladder (WHISPER_TEMPERATURES="0.0,0.2,0.4") caps that worst
+    case at the cost of giving up earlier on genuinely hard audio. Default is
+    unchanged from Whisper's own; measure with the [asr] fallback log line
+    below before trading accuracy for it."""
+    raw = os.environ.get("WHISPER_TEMPERATURES")
+    if not raw:
+        return [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    return [float(x) for x in raw.split(",") if x.strip()]
+
+
+def _log_fallback(segments):
+    """Report chunks that needed a temperature fallback -- the per-chunk cost
+    multiplier that is otherwise completely invisible."""
+    hits = [s for s in segments if (s.get("temperature") or 0) > 0]
+    if hits:
+        worst = max(s["temperature"] for s in hits)
+        print(f"[asr] temperature fallback fired on {len(hits)}/{len(segments)} "
+              f"segment(s) in this chunk (up to T={worst}) -- the chunk was "
+              f"decoded more than once", file=sys.stderr, flush=True)
+
+
 def _confidence(avg_logprob) -> "float | None":
     """avg_logprob (mean per-token log-probability, both backends already
     compute this for temperature-fallback / compression-ratio checks -- it was
@@ -156,7 +195,7 @@ def transcribe_chunk(audio, sample_rate: int = 16000, word_timestamps: bool = Fa
         import mlx_whisper
         r = mlx_whisper.transcribe(
             audio, path_or_hf_repo=str(MLX_MODEL_DIR), language="fa", task="transcribe",
-            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0), compression_ratio_threshold=2.4,
+            temperature=tuple(_temperatures()), compression_ratio_threshold=2.4,
             no_speech_threshold=0.45, condition_on_previous_text=False,
             word_timestamps=word_timestamps, verbose=None)
         out = []
@@ -168,15 +207,17 @@ def transcribe_chunk(audio, sample_rate: int = 16000, word_timestamps: bool = Fa
                      for w in (s.get("words") or [])] if word_timestamps else None
             out.append({"start": s["start"], "end": s["end"], "text": s["text"],
                         "confidence": _confidence(s.get("avg_logprob")),
+                        "temperature": s.get("temperature"),
                         "words": words or None})
+        _log_fallback(out)
         return out
 
     # ctranslate2 / faster-whisper -- pipeline.py already VAD-chunked the
     # audio, so vad_filter is off here to avoid re-segmenting a chunk that's
     # already speech-only.
     segments, _info = _ct2_model.transcribe(
-        audio, language="fa", task="transcribe", beam_size=5,
-        temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0], compression_ratio_threshold=2.4,
+        audio, language="fa", task="transcribe", beam_size=BEAM_SIZE,
+        temperature=_temperatures(), compression_ratio_threshold=2.4,
         no_speech_threshold=0.45, condition_on_previous_text=False,
         vad_filter=False, word_timestamps=word_timestamps)
     out = []
@@ -185,5 +226,7 @@ def transcribe_chunk(audio, sample_rate: int = 16000, word_timestamps: bool = Fa
                  for w in (getattr(s, "words", None) or [])] if word_timestamps else None
         out.append({"start": s.start, "end": s.end, "text": s.text,
                     "confidence": _confidence(getattr(s, "avg_logprob", None)),
+                    "temperature": getattr(s, "temperature", None),
                     "words": words or None})
+    _log_fallback(out)
     return out
