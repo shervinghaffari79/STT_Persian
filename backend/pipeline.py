@@ -25,6 +25,7 @@ An optional `correct_fn(text, speaker, context) -> text` hook (see correct.py)
 can be supplied to lightly clean up each segment's text right after it is
 produced, before it is streamed to the client or included in the final result.
 """
+import difflib
 import os
 import subprocess
 import sys
@@ -582,6 +583,47 @@ def _split_on_speaker(words, turns, min_words=2, carry_label=None, carry_count=0
     return [[spk, [words[i] for i in members]] for spk, members in runs]
 
 
+# Below this ratio, two adjacent segments are treated as unrelated content --
+# calibrated against real transcripts: genuinely different neighbouring
+# segments from the same recording scored 0.28-0.42, while a confirmed
+# hallucinated repeat (a whole paragraph re-decoded with a handful of words
+# swapped) scored 0.74. 0.6 sits well clear of both.
+DEDUPE_THRESHOLD = float(os.environ.get("DEDUPE_THRESHOLD", "0.6"))
+
+
+def _dedupe_repeats(chunk_segments):
+    """Drop a segment that is a near-verbatim repeat of the one immediately
+    before it, within the SAME transcribe_chunk() call.
+
+    Whisper -- on both the MLX and CTranslate2 backends -- can hallucinate a
+    second, slightly reworded copy of a sentence it just decoded: its own
+    internal multi-segment timestamp prediction drifts inside one decode and
+    it re-emits instead of moving on, rather than the speaker genuinely
+    repeating several sentences almost word-for-word. This is a decoder
+    artifact, not two audio windows overlapping (VAD-derived chunks never
+    share audio samples -- see _asr_chunks), so it always shows up as
+    adjacent entries in one chunk's segment list.
+    Compare ONLY immediate neighbours -- a real repeated phrase minutes apart
+    must survive -- and require near-verbatim similarity (DEDUPE_THRESHOLD),
+    not just "same topic", so a person genuinely restating something in
+    different words is left alone. Keep the LATER copy: on the samples that
+    surfaced this, the earlier copy's word timestamps were the ones that got
+    diarized to the wrong speaker."""
+    if not chunk_segments:
+        return chunk_segments
+    out = [chunk_segments[0]]
+    for s in chunk_segments[1:]:
+        prev_text, text = out[-1]["text"].strip(), s["text"].strip()
+        ratio = difflib.SequenceMatcher(None, prev_text, text).ratio() if prev_text and text else 0.0
+        if ratio >= DEDUPE_THRESHOLD:
+            print(f"[asr] dropped near-duplicate segment (similarity {ratio:.2f}): "
+                 f"{prev_text[:60]!r} vs {text[:60]!r}", file=sys.stderr, flush=True)
+            out[-1] = s
+        else:
+            out.append(s)
+    return out
+
+
 def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
                correct_fn=None) -> dict:
     import asr_engine
@@ -654,6 +696,7 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
         chunk_segments = asr_engine.transcribe_chunk(
             audio[a:b], SAMPLE_RATE,
             word_timestamps=bool(turns) and WORD_LEVEL_DIARIZATION)
+        chunk_segments = _dedupe_repeats(chunk_segments)
         off = a / SAMPLE_RATE
 
         def _emit(spk_raw, st, en, raw, words, confidence):
