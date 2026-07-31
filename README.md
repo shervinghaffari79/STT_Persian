@@ -68,7 +68,7 @@ backend is proxied internally and never exposed directly.
 - **Node.js 16+** and npm
 - **Python 3.9+** and **ffmpeg** (`brew install ffmpeg` / `choco install ffmpeg` / `apt install ffmpeg`)
 - **macOS + Apple Silicon** — uses MLX on the Metal GPU; needs the model at
-  `../models/whisper-large-v3-persian-mlx-q8` (repo root).
+  `models/whisper-large-v3-persian-mlx-q8` (inside the repo root).
 - **Windows / Linux / other Mac** — uses faster-whisper (CTranslate2) +
   `transformers` instead; see [Windows Server / NVIDIA GPU](#-windows-server--nvidia-gpu-deployment) below.
   Backend selection is automatic (see `backend/asr_engine.py`, `backend/chat.py`).
