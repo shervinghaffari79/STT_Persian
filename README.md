@@ -45,9 +45,13 @@ on `/api/transcribe`; it's a no-op if the key isn't set.
 
 - 🎯 **Local Persian ASR** — fine-tuned Whisper large-v3, GPU-accelerated via MLX
 - 🗣️ **Speaker diarization** — automatic speaker separation and labels
+- ✏️ **Speaker manager** — rename anonymous speaker ids (S1, S2, …) to real
+  names, and merge ids diarization over-segmented for the same person;
+  merges are stored as reversible redirects, never rewriting the original
+  segments
 - ⏱️ **Timestamped segments** with per-word timings; export to SRT / TXT / JSON
 - 🤖 **AI analysis panel** — chat over the transcript with a **local Qwen3-4B (MLX)** model (streamed, on-device, no cloud)
-- 🎨 **Modern, responsive dark UI** (React + Tailwind + Vite)
+- 🎨 **Modern, responsive UI** (React + Tailwind + Vite) with a **dark/light theme toggle** (follows OS preference until you pick one explicitly, then remembers it)
 
 ## 🏗️ Architecture
 
@@ -251,10 +255,25 @@ npm run preview
 
 ```
 src/
-├── components/     # Reusable React components
-├── pages/         # Page components
-├── styles/        # Global styles
-└── App.tsx        # Main application component
+├── App.tsx              # Main application component
+├── components/
+│   ├── AudioPanel.tsx        # Waveform playback + seek
+│   ├── TranscriptPanel.tsx   # Segment list, click-to-seek, per-word timing
+│   ├── SpeakerManager.tsx    # Rename/merge diarized speaker ids
+│   ├── ChatPanel.tsx         # AI analysis chat over the transcript
+│   └── Markdown.tsx          # Renders chat replies
+├── hooks/
+│   └── useTheme.ts      # Dark/light theme state (localStorage + OS preference)
+├── services/            # Calls to the FastAPI backend (/api/*)
+├── utils/                # clipboard, classnames helpers
+└── index.css             # Tailwind + theme tokens
+
+backend/
+├── server.py         # FastAPI app, /api/* routes
+├── pipeline.py        # VAD chunking → ASR → diarization → speaker assignment
+├── asr_engine.py      # Whisper backend selection (MLX / CTranslate2)
+├── chat.py            # Qwen3-4B backend selection (MLX / transformers)
+└── correct.py         # optional per-segment GPT cleanup pass
 ```
 
 ## 🔧 Configuration
