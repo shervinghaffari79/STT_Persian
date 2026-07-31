@@ -259,18 +259,18 @@ export default function ChatPanel({
   );
 
   return (
-    <div className="flex flex-col h-full bg-[#0f0f0f]">
+    <div className="flex flex-col h-full bg-[var(--bg-base)]">
       {/* Header */}
       <div className="panel-header px-4 py-3 flex items-center gap-2">
         <div className="w-7 h-7 rounded-lg bg-emerald-500/20 flex items-center justify-center">
           <MessageSquare size={14} className="text-emerald-400" />
         </div>
-        <span className="text-sm font-semibold text-white flex-1">AI Analysis</span>
+        <span className="text-sm font-semibold text-[var(--text-primary)] flex-1">AI Analysis</span>
         <div className="flex items-center gap-1">
           <button
             onClick={() => setView('history')}
             className={`w-7 h-7 flex items-center justify-center rounded-lg transition-colors ${
-              view === 'history' ? 'bg-indigo-500/20 text-indigo-300' : 'hover:bg-white/5 text-gray-400 hover:text-white'
+              view === 'history' ? 'bg-indigo-500/20 text-indigo-300' : 'hover:bg-[var(--bg-active)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
             }`}
             title="Chat history"
           >
@@ -278,7 +278,7 @@ export default function ChatPanel({
           </button>
           <button
             onClick={createNewSession}
-            className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-white/5 text-gray-400 hover:text-white transition-colors"
+            className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-[var(--bg-active)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
             title="New chat"
           >
             <Plus size={14} />
@@ -289,22 +289,22 @@ export default function ChatPanel({
       {/* History View */}
       {view === 'history' ? (
         <div className="flex-1 flex flex-col overflow-hidden">
-          <div className="p-3 border-b border-[#1e1e1e]">
+          <div className="p-3 border-b border-[var(--border-shell)]">
             <div className="relative">
-              <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" />
+              <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
               <input
                 value={historySearch}
                 onChange={e => setHistorySearch(e.target.value)}
                 placeholder="Search history..."
-                className="w-full bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg pl-7 pr-3 py-1.5 text-xs text-white placeholder-gray-600 focus:border-indigo-500/50 transition-colors"
+                className="w-full bg-[var(--bg-raised)] border border-[var(--border-subtle)] rounded-lg pl-7 pr-3 py-1.5 text-xs text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:border-indigo-500/50 transition-colors"
               />
             </div>
           </div>
           <div className="flex-1 overflow-y-auto p-3 space-y-1">
             {filteredSessions.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 text-center">
-                <History size={24} className="text-gray-600 mb-2" />
-                <p className="text-sm text-gray-500">No chat history yet</p>
+                <History size={24} className="text-[var(--text-muted)] mb-2" />
+                <p className="text-sm text-[var(--text-muted)]">No chat history yet</p>
                 <button
                   onClick={createNewSession}
                   className="mt-3 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
@@ -319,23 +319,23 @@ export default function ChatPanel({
                   className={`group flex items-center gap-2 px-3 py-2.5 rounded-xl cursor-pointer transition-all ${
                     session.id === activeSessionId
                       ? 'bg-indigo-500/15 border border-indigo-500/30'
-                      : 'hover:bg-white/[0.03] border border-transparent'
+                      : 'hover:bg-[var(--bg-active)] border border-transparent'
                   }`}
                   onClick={() => { setActiveSessionId(session.id); setView('chat'); }}
                 >
-                  <div className="w-7 h-7 rounded-lg bg-[#1e1e1e] flex items-center justify-center flex-shrink-0">
-                    <MessageSquare size={12} className="text-gray-500" />
+                  <div className="w-7 h-7 rounded-lg bg-[var(--bg-inset)] flex items-center justify-center flex-shrink-0">
+                    <MessageSquare size={12} className="text-[var(--text-muted)]" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <p className="text-xs font-medium text-gray-200 truncate">{session.title}</p>
-                    <p className="text-[10px] text-gray-600 flex items-center gap-1">
+                    <p className="text-xs font-medium text-[var(--text-primary)] truncate">{session.title}</p>
+                    <p className="text-[10px] text-[var(--text-muted)] flex items-center gap-1">
                       <Clock size={9} />
                       {formatDate(session.updatedAt)} · {session.messages.length} msgs
                     </p>
                   </div>
                   <button
                     onClick={(e) => { e.stopPropagation(); deleteSession(session.id); }}
-                    className="opacity-0 group-hover:opacity-100 w-6 h-6 flex items-center justify-center rounded-md hover:bg-red-500/20 text-gray-500 hover:text-red-400 transition-all"
+                    className="opacity-0 group-hover:opacity-100 w-6 h-6 flex items-center justify-center rounded-md hover:bg-red-500/20 text-[var(--text-muted)] hover:text-red-400 transition-all"
                   >
                     <Trash2 size={11} />
                   </button>
@@ -355,10 +355,10 @@ export default function ChatPanel({
                   <div className="w-14 h-14 bg-gradient-to-br from-emerald-500/20 to-indigo-500/20 rounded-2xl flex items-center justify-center mx-auto mb-3 border border-emerald-500/20">
                     <Sparkles size={24} className="text-emerald-400" />
                   </div>
-                  <h3 className="text-sm font-semibold text-white mb-1">
+                  <h3 className="text-sm font-semibold text-[var(--text-primary)] mb-1">
                     {transcription ? 'Analyze Your Transcript' : 'AI Chat Assistant'}
                   </h3>
-                  <p className="text-xs text-gray-500 max-w-[200px] mx-auto">
+                  <p className="text-xs text-[var(--text-muted)] max-w-[200px] mx-auto">
                     {transcription
                       ? 'Ask anything about your transcribed audio'
                       : 'Transcribe audio first for context-aware analysis'
@@ -369,7 +369,7 @@ export default function ChatPanel({
                 {/* Suggested prompts */}
                 {transcription && (
                   <div className="space-y-2">
-                    <p className="text-[11px] text-gray-500 font-medium uppercase tracking-wide">Suggested</p>
+                    <p className="text-[11px] text-[var(--text-muted)] font-medium uppercase tracking-wide">Suggested</p>
                     <div className="space-y-1.5">
                       {SUGGESTED_PROMPTS.map(prompt => (
                         <button
@@ -378,7 +378,7 @@ export default function ChatPanel({
                             setInput(prompt);
                             textareaRef.current?.focus();
                           }}
-                          className="w-full text-left px-3 py-2 rounded-xl bg-[#161616] border border-[#222] hover:border-indigo-500/30 text-xs text-gray-300 hover:text-white transition-all flex items-center gap-2"
+                          className="w-full text-left px-3 py-2 rounded-xl bg-[var(--bg-inset)] border border-[var(--border-shell)] hover:border-indigo-500/30 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-all flex items-center gap-2"
                         >
                           <ChevronRight size={12} className="text-indigo-400 flex-shrink-0" />
                           {prompt}
@@ -408,7 +408,7 @@ export default function ChatPanel({
                     <div className={`group flex-1 max-w-[85%] ${msg.role === 'user' ? 'flex flex-col items-end' : ''} min-w-0`}>
                       {editingId === msg.id ? (
                         /* inline edit of a user question */
-                        <div className="w-full bg-[#161616] border border-indigo-500/50 rounded-2xl px-3 py-2">
+                        <div className="w-full bg-[var(--bg-inset)] border border-indigo-500/50 rounded-2xl px-3 py-2">
                           <textarea
                             value={editText}
                             onChange={e => setEditText(e.target.value)}
@@ -418,12 +418,12 @@ export default function ChatPanel({
                             }}
                             dir="auto"
                             autoFocus
-                            className="w-full bg-transparent text-sm text-white resize-none outline-none text-right leading-relaxed"
+                            className="w-full bg-transparent text-sm text-[var(--text-primary)] resize-none outline-none text-right leading-relaxed"
                             rows={2}
                           />
                           <div className="flex items-center justify-end gap-2 mt-1.5">
                             <button onClick={() => setEditingId(null)}
-                              className="text-[11px] px-2 py-1 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 flex items-center gap-1">
+                              className="text-[11px] px-2 py-1 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] flex items-center gap-1">
                               <X size={11} /> لغو
                             </button>
                             <button onClick={saveEdit} disabled={!editText.trim()}
@@ -435,13 +435,13 @@ export default function ChatPanel({
                       ) : (
                         <div className={`rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed break-words ${
                           msg.role === 'user'
-                            ? 'chat-bubble-user text-gray-200 rounded-tr-sm'
-                            : 'chat-bubble-ai text-gray-200 rounded-tl-sm'
+                            ? 'chat-bubble-user text-[var(--text-primary)] rounded-tr-sm'
+                            : 'chat-bubble-ai text-[var(--text-primary)] rounded-tl-sm'
                         }`}>
                           {msg.isStreaming && msg.content === '' ? (
                             <div className="flex items-center gap-1 py-1">
                               {[0, 1, 2].map(i => (
-                                <div key={i} className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"
+                                <div key={i} className="w-1.5 h-1.5 bg-[var(--text-muted)] rounded-full animate-bounce"
                                   style={{ animationDelay: `${i * 0.15}s` }} />
                               ))}
                             </div>
@@ -458,16 +458,16 @@ export default function ChatPanel({
                       {/* Actions */}
                       {editingId !== msg.id && (
                         <div className={`flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 transition-opacity ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                          <span className="text-[10px] text-gray-600">{formatTime(msg.timestamp)}</span>
+                          <span className="text-[10px] text-[var(--text-muted)]">{formatTime(msg.timestamp)}</span>
                           {msg.role === 'user' && !isStreaming && (
                             <button onClick={() => startEdit(msg)}
-                              className="text-gray-500 hover:text-indigo-300 transition-colors" title="ویرایش سوال">
+                              className="text-[var(--text-muted)] hover:text-indigo-300 transition-colors" title="ویرایش سوال">
                               <Pencil size={11} />
                             </button>
                           )}
                           {msg.role === 'assistant' && !msg.isStreaming && (
                             <button onClick={() => copyMessage(msg.id, msg.content)}
-                              className="text-gray-500 hover:text-gray-300 transition-colors"
+                              className="text-[var(--text-muted)] hover:text-[var(--text-secondary)] transition-colors"
                               title={copyErrorMsgId === msg.id ? 'کپی ناموفق بود -- کلیپ‌بورد در دسترس نیست' : 'کپی'}>
                               {copiedMsgId === msg.id
                                 ? <Check size={11} className="text-green-400" />
@@ -487,18 +487,18 @@ export default function ChatPanel({
           </div>
 
           {/* Input Area */}
-          <div className="p-3 border-t border-[#1e1e1e]">
+          <div className="p-3 border-t border-[var(--border-shell)]">
             {/* Transcript context indicator */}
             {transcription && (
               <div className="flex items-center gap-1.5 mb-2 px-1">
                 <div className="w-1.5 h-1.5 rounded-full bg-green-400" />
-                <span className="text-[10px] text-gray-500">
+                <span className="text-[10px] text-[var(--text-muted)]">
                   Context: <span className="text-green-400">{transcription.fileName}</span>
                 </span>
               </div>
             )}
 
-            <div className="flex items-end gap-2 bg-[#161616] border border-[#2a2a2a] rounded-2xl px-3 py-2 focus-within:border-indigo-500/50 transition-colors">
+            <div className="flex items-end gap-2 bg-[var(--bg-inset)] border border-[var(--border-subtle)] rounded-2xl px-3 py-2 focus-within:border-indigo-500/50 transition-colors">
               <textarea
                 ref={textareaRef}
                 value={input}
@@ -506,7 +506,7 @@ export default function ChatPanel({
                 onKeyDown={handleKeyDown}
                 placeholder={transcription ? 'سوال خود را بپرسید...' : 'یک مکالمه شروع کنید...'}
                 dir="rtl"
-                className="flex-1 bg-transparent text-sm text-white placeholder-gray-600 resize-none max-h-32 min-h-[36px] leading-relaxed text-right"
+                className="flex-1 bg-transparent text-sm text-[var(--text-primary)] placeholder-[var(--text-muted)] resize-none max-h-32 min-h-[36px] leading-relaxed text-right"
                 rows={1}
                 style={{ height: 'auto' }}
                 onInput={e => {

@@ -1,11 +1,21 @@
 # Local Persian SOTA ASR backend
-# (assumes ffmpeg is installed on the system, e.g. `brew install ffmpeg`)
+# ffmpeg must be installed and on PATH:
+#   macOS:   brew install ffmpeg
+#   Windows: choco install ffmpeg   (or download a build and add to PATH)
+#   Linux:   apt install ffmpeg
 fastapi
 uvicorn[standard]
 python-multipart
 
-# ASR pipeline
+# --- ASR: install ONE of the two backends below (see backend/asr_engine.py) ---
+# macOS + Apple Silicon (used automatically if present):
 mlx-whisper          # Apple-Silicon GPU Whisper (Metal)
+# Windows / Linux / other Mac (used automatically otherwise; CUDA if an
+# NVIDIA GPU is present, else CPU int8):
+faster-whisper       # CTranslate2 Whisper runtime
+ctranslate2
+
+# shared ASR pipeline pieces (cross-platform)
 silero-vad           # voice activity detection
 pyannote.audio       # speaker diarization 3.1 (gated - needs HF token, see README)
 resemblyzer          # diarization fallback (used only if pyannote is unavailable)
@@ -14,6 +24,20 @@ hazm                 # Persian text normalization
 numpy
 soundfile
 
-# local chat LLM (AI Analysis panel)
+# --- Chat (AI Analysis panel): install ONE of the two backends below (see backend/chat.py) ---
+# macOS + Apple Silicon (used automatically if present):
 mlx-lm               # runs Qwen3-4B-Instruct-2507-4bit on the GPU
+# Windows / Linux / other Mac (used automatically otherwise; CUDA if an
+# NVIDIA GPU is present, else CPU):
+# torch + transformers below also cover this -- accelerate speeds up GPU loading
+accelerate
 transformers>=4.37   # required for the Qwen2 tokenizer (do NOT let NeMo pin it to 4.33)
+
+# On Windows/Linux with an NVIDIA GPU, install a CUDA build of torch BEFORE the
+# rest of this file, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# otherwise `pip install -r requirements.txt` pulls the CPU build.
+
+# optional per-segment GPT cleanup pass (correct.py) -- no-op without OPENAI_API_KEY
+openai
+pydantic

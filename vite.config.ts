@@ -17,10 +17,17 @@ export default defineConfig({
     },
   },
   server: {
-    // proxy API calls to the local FastAPI backend (backend/server.py on :8000)
+    // Only the frontend is meant to be network/internet-exposed: bind to all
+    // interfaces on :5000 (override with FRONTEND_PORT). The FastAPI backend
+    // (backend/server.py) stays on 127.0.0.1 -- never exposed directly -- and
+    // is reached only through the proxy below, which runs on this same
+    // machine regardless of who is connecting to :5000.
+    host: true,
+    port: Number(process.env.FRONTEND_PORT) || 5000,
+    strictPort: true,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8000",
+        target: `http://127.0.0.1:${process.env.BACKEND_PORT || 8000}`,
         changeOrigin: true,
       },
     },

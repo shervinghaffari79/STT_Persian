@@ -10,19 +10,23 @@ import { Clock } from 'lucide-react';
  * mixed Persian / Latin / numbers keep correct bidirectional order. Builds real
  * React nodes (no dangerouslySetInnerHTML) so it is XSS-safe.
  *
- * Also recognizes [MM:SS] / [H:MM:SS] citations -- chat.py's system prompt
- * (backend/chat.py: _system_prompt) is instructed to cite the transcript's own
- * timestamps in exactly this bracket form when referencing it, matching the
- * format buildChatTranscript() (ChatPanel.tsx) embeds per segment. Rendered as
- * a clickable marker via the optional onCite callback so a claim in the AI's
- * answer can be checked against the actual audio/transcript it came from.
+ * Also recognizes [Sx MM:SS] / [Sx H:MM:SS] citations, optionally without the
+ * speaker (bare [MM:SS] / [H:MM:SS]) -- chat.py's system prompt shows the
+ * model transcript lines in the form "[S1 04:12]: ...", the same bracket
+ * buildChatTranscript() (ChatPanel.tsx) embeds per segment, and asks it to
+ * "copy that line's timestamp verbatim". A model told to copy verbatim from a
+ * bracket it can see naturally reproduces the WHOLE bracket, speaker included
+ * -- so both forms are accepted here rather than fighting that tendency.
+ * Rendered as a clickable marker via the optional onCite callback so a claim
+ * in the AI's answer can be checked against the actual audio/transcript it
+ * came from.
  */
 
-// [MM:SS] or [H:MM:SS], e.g. [04:12] or [1:04:12]
-const TIMESTAMP = /\[(\d{1,2}:)?\d{1,2}:\d{2}\]/;
+// [S1 04:12], [S12 1:04:12], or bare [04:12] / [1:04:12]
+const TIMESTAMP = /\[(?:S\d+\s+)?(\d{1,2}:)?\d{1,2}:\d{2}\]/;
 
 function parseTimestamp(token: string): number | null {
-  const inner = token.slice(1, -1);
+  const inner = token.slice(1, -1).replace(/^S\d+\s+/, '');
   const parts = inner.split(':').map(Number);
   if (parts.some(Number.isNaN)) return null;
   return parts.length === 3
@@ -33,7 +37,7 @@ function parseTimestamp(token: string): number | null {
 // inline: **bold**, *italic*, `code`, [MM:SS] citations
 function renderInline(text: string, keyPrefix: string, onCite?: (seconds: number) => void): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  const re = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*|\[(?:\d{1,2}:)?\d{1,2}:\d{2}\])/g;
+  const re = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*|\[(?:S\d+\s+)?(?:\d{1,2}:)?\d{1,2}:\d{2}\])/g;
   let last = 0;
   let m: RegExpExecArray | null;
   let i = 0;
@@ -42,9 +46,9 @@ function renderInline(text: string, keyPrefix: string, onCite?: (seconds: number
     const tok = m[0];
     const key = `${keyPrefix}-${i++}`;
     if (tok.startsWith('**')) {
-      nodes.push(<strong key={key} className="font-semibold text-white">{tok.slice(2, -2)}</strong>);
+      nodes.push(<strong key={key} className="font-semibold text-[var(--text-primary)]">{tok.slice(2, -2)}</strong>);
     } else if (tok.startsWith('`')) {
-      nodes.push(<code key={key} className="px-1 py-0.5 rounded bg-black/40 text-[0.85em] font-mono text-indigo-200" dir="ltr">{tok.slice(1, -1)}</code>);
+      nodes.push(<code key={key} className="px-1 py-0.5 rounded bg-[var(--code-bg)] text-[0.85em] font-mono text-[var(--accent-text)]" dir="ltr">{tok.slice(1, -1)}</code>);
     } else if (TIMESTAMP.test(tok)) {
       const seconds = parseTimestamp(tok);
       nodes.push(
@@ -97,7 +101,7 @@ export default function Markdown({ content, onCite }: MarkdownProps) {
       while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(lines[i]); i++; }
       i++; // closing fence
       blocks.push(
-        <pre key={key++} dir="ltr" className="my-1.5 p-2.5 rounded-lg bg-black/50 overflow-x-auto text-[0.82em] font-mono text-gray-200 leading-relaxed">
+        <pre key={key++} dir="ltr" className="my-1.5 p-2.5 rounded-lg bg-[var(--code-bg)] overflow-x-auto text-[0.82em] font-mono text-[var(--text-primary)] leading-relaxed">
           <code>{buf.join('\n')}</code>
         </pre>,
       );
@@ -107,7 +111,7 @@ export default function Markdown({ content, onCite }: MarkdownProps) {
     // heading
     const h = HEADING.exec(line);
     if (h) {
-      blocks.push(<div key={key++} dir="auto" className="font-semibold text-white mt-2 mb-0.5">{renderInline(h[2], `h${key}`, onCite)}</div>);
+      blocks.push(<div key={key++} dir="auto" className="font-semibold text-[var(--text-primary)] mt-2 mb-0.5">{renderInline(h[2], `h${key}`, onCite)}</div>);
       i++;
       continue;
     }

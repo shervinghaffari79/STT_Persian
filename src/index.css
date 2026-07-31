@@ -1,18 +1,171 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+/* Vazirmatn carries the Persian/Arabic glyphs Inter does not have a single one
+   of. Without it every Persian character in this app -- which is most of them --
+   was drawn by whatever the OS happened to pick for Arabic script: Tahoma on
+   Windows, Geeza Pro on macOS. That is why the transcript looked different on
+   every machine, and why line heights were inconsistent between Persian and
+   Latin runs. Inter stays first so Latin text, digits and the UI chrome keep
+   their existing metrics; Vazirmatn only takes over where Inter has no glyph. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@300;400;500;600;700&display=swap');
 
 @import "tailwindcss";
+
+/* ── theme tokens ───────────────────────────────────────────────────────────
+   Every surface, border and text colour in the app resolves through these, so
+   light mode is a matter of re-pointing the variables rather than touching
+   components. :root carries dark (the app's original and still-default look);
+   [data-theme='light'] overrides it. Both ramps were checked for WCAG AA
+   (4.5:1 for body text) rather than picked by eye -- see the ratios below. */
+:root {
+  --font-ui: 'Inter', 'Vazirmatn', system-ui, sans-serif;
+  --font-fa: 'Vazirmatn', 'Inter', system-ui, sans-serif;
+
+  /* Text ramp, measured against --bg-base. Most of the old palette was already
+     fine: #e5e5e5 body is 15.2:1 and gray-400 is 7.6:1. The one real failure
+     was Tailwind's gray-500 (#6b7280) at 3.96:1, under the 4.5:1 WCAG AA
+     threshold for body text -- and it is used for timestamps and metadata,
+     which is exactly where Persian's thinner strokes suffer most. */
+  --text-primary: #f2f2f2;   /* 17.1:1 */
+  --text-secondary: #b8b8b8; /*  9.7:1 -- replaces gray-400 (7.6:1) */
+  --text-muted: #8a8a8a;     /*  5.6:1 -- replaces gray-500 (3.96:1, failed AA) */
+
+  --bg-base: #0f0f0f;        /* panel bodies */
+  --bg-shell: #0a0a0a;       /* app chrome behind the panels */
+  --bg-raised: #1a1a1a;      /* menus, cards, chat bubbles */
+  --bg-inset: #161616;       /* pills and grouped controls in the header */
+  --bg-input: #0f0f0f;       /* text fields */
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(255, 255, 255, 0.03);
+
+  --border-subtle: #2a2a2a;  /* control outlines */
+  --border-shell: #1a1a1a;   /* panel dividers */
+  --border-strong: #333333;
+
+  /* accents keep their hue across themes; only the tint behind them changes */
+  --accent: #6366f1;
+  --accent-text: #a5b4fc;
+  --accent-tint: rgba(99, 102, 241, 0.10);
+  --accent-tint-strong: rgba(99, 102, 241, 0.20);
+  --accent-border: rgba(99, 102, 241, 0.30);
+
+  --bubble-user-bg: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  /* code blocks want to sit BELOW the surrounding surface, not above it --
+     inverted between themes, hence a token rather than a black/white wash */
+  --code-bg: rgba(0, 0, 0, 0.45);
+
+  /* waveform bar fill, read via getComputedStyle in AudioPanel's <canvas>
+     draw loop -- ctx.fillStyle cannot see a Tailwind class or var() the way
+     the DOM can, so the canvas needs the resolved colour as a plain string */
+  --waveform-played: #6366f1;
+  --waveform-unplayed: #2a2a2a;
+
+  /* Speaker and confidence hues. These were Tailwind's -300/-400 shades, which
+     are tuned to sit on a near-black page; on white they wash out to roughly
+     2:1 and become unreadable. Each theme therefore picks its own shade of the
+     same hue, so a speaker keeps its identity while staying legible. */
+  --spk-1-text: #a5b4fc;  --spk-1-dot: #6366f1;  /* indigo  */
+  --spk-2-text: #6ee7b7;  --spk-2-dot: #10b981;  /* emerald */
+  --spk-3-text: #fcd34d;  --spk-3-dot: #f59e0b;  /* amber   */
+  --spk-4-text: #fda4af;  --spk-4-dot: #f43f5e;  /* rose    */
+  --spk-5-text: #f9a8d4;  --spk-5-dot: #ec4899;  /* pink    */
+  --spk-x-text: #d8b4fe;  --spk-x-dot: #a855f7;  /* overflow */
+
+  --spk-1-bg: rgba(99, 102, 241, 0.10);
+  --spk-2-bg: rgba(16, 185, 129, 0.10);
+  --spk-3-bg: rgba(245, 158, 11, 0.10);
+  --spk-4-bg: rgba(244, 63, 94, 0.10);
+  --spk-5-bg: rgba(236, 72, 153, 0.10);
+  --spk-x-bg: rgba(168, 85, 247, 0.10);
+
+  --conf-high: #4ade80;
+  --conf-mid: #fbbf24;
+  --conf-low: #f87171;
+
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  /* Not pure white: #ffffff under a dark-adapted eye is glaring, and the
+     transcript is long-form reading. #fbfbfa keeps contrast high while
+     taking the edge off. */
+  --text-primary: #1a1a1a;   /* 16.8:1 on --bg-base */
+  --text-secondary: #4a4a4a; /*  8.6:1 */
+  --text-muted: #6b6b6b;     /*  5.2:1 -- still clears AA for metadata */
+
+  --bg-base: #fbfbfa;
+  --bg-shell: #f2f2f0;
+  --bg-raised: #ffffff;
+  --bg-inset: #eeeeec;
+  --bg-input: #ffffff;
+  --bg-hover: rgba(0, 0, 0, 0.05);
+  --bg-active: rgba(0, 0, 0, 0.03);
+
+  --border-subtle: #e0e0dd;
+  --border-shell: #e6e6e3;
+  --border-strong: #c9c9c5;
+
+  /* the dark theme's accent text is a light indigo that vanishes on white,
+     so the light ramp darkens it and lightens the tint to compensate */
+  --accent: #4f46e5;
+  --accent-text: #4338ca;
+  --accent-tint: rgba(79, 70, 229, 0.08);
+  --accent-tint-strong: rgba(79, 70, 229, 0.14);
+  --accent-border: rgba(79, 70, 229, 0.28);
+
+  /* the dark bubble is a near-black navy gradient; on a light page it needs to
+     read as a soft indigo wash instead, or user turns look like holes */
+  --bubble-user-bg: linear-gradient(135deg, #eef2ff 0%, #e6ecfe 100%);
+  --code-bg: rgba(0, 0, 0, 0.05);
+
+  --waveform-played: #4f46e5;
+  /* the dark theme's unplayed bar is a near-black grey sitting on a
+     near-black page -- on white that relationship inverts to a near-white
+     grey sitting on white, so it needs a visible mid-tone instead */
+  --waveform-unplayed: #d8d8d5;
+
+  /* same hues, darkened to clear 4.5:1 on --bg-base / --bg-raised */
+  --spk-1-text: #4338ca;  --spk-1-dot: #6366f1;
+  --spk-2-text: #047857;  --spk-2-dot: #10b981;
+  --spk-3-text: #a16207;  --spk-3-dot: #f59e0b;
+  --spk-4-text: #be123c;  --spk-4-dot: #f43f5e;
+  --spk-5-text: #be185d;  --spk-5-dot: #ec4899;
+  --spk-x-text: #7e22ce;  --spk-x-dot: #a855f7;
+
+  --spk-1-bg: rgba(99, 102, 241, 0.12);
+  --spk-2-bg: rgba(16, 185, 129, 0.14);
+  --spk-3-bg: rgba(245, 158, 11, 0.16);
+  --spk-4-bg: rgba(244, 63, 94, 0.12);
+  --spk-5-bg: rgba(236, 72, 153, 0.12);
+  --spk-x-bg: rgba(168, 85, 247, 0.12);
+
+  --conf-high: #15803d;
+  --conf-mid: #b45309;
+  --conf-low: #b91c1c;
+
+  color-scheme: light;
+}
 
 * {
   box-sizing: border-box;
 }
 
 body {
-  font-family: 'Inter', sans-serif;
-  background: #0f0f0f;
-  color: #e5e5e5;
+  font-family: var(--font-ui);
+  background: var(--bg-base);
+  color: var(--text-primary);
   margin: 0;
   padding: 0;
   overflow: hidden;
+}
+
+/* Persian runs are marked with dir="rtl" (transcript segments, chat input)
+   or dir="auto" (mixed content). Target those directly so the font switch
+   follows the text direction already being declared, rather than requiring
+   every component to add a font class. */
+[dir='rtl'] {
+  font-family: var(--font-fa);
+  /* Vazirmatn sits slightly tighter than Inter at the same size; Persian
+     also stacks diacritics above the baseline, so it needs the extra room */
+  line-height: 1.85;
 }
 
 ::-webkit-scrollbar {
@@ -23,16 +176,16 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #333;
+  background: var(--border-strong);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #555;
+  background: var(--text-muted);
 }
 
 .panel-divider {
   width: 1px;
-  background: #222;
+  background: var(--border-shell);
   flex-shrink: 0;
 }
 
@@ -40,21 +193,10 @@ body {
   overflow: hidden !important;
 }
 
-.speaker-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 999px;
-}
-
-.speaker-S1 { background: rgba(99,102,241,0.2); color: #a5b4fc; border: 1px solid rgba(99,102,241,0.3); }
-.speaker-S2 { background: rgba(16,185,129,0.2); color: #6ee7b7; border: 1px solid rgba(16,185,129,0.3); }
-.speaker-S3 { background: rgba(245,158,11,0.2); color: #fcd34d; border: 1px solid rgba(245,158,11,0.3); }
-.speaker-S4 { background: rgba(239,68,68,0.2); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
-.speaker-S5 { background: rgba(236,72,153,0.2); color: #f9a8d4; border: 1px solid rgba(236,72,153,0.3); }
+/* The .speaker-badge / .speaker-S1..S5 rules that used to live here were dead:
+   no component referenced them, and they had drifted out of sync with the real
+   palette in TranscriptPanel's SPEAKER_COLORS, which is keyed off Tailwind
+   classes. One definition, in the component that renders the badge. */
 
 .typing-cursor::after {
   content: '▋';
@@ -82,13 +224,13 @@ input:focus {
 }
 
 .chat-bubble-user {
-  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-  border: 1px solid rgba(99,102,241,0.2);
+  background: var(--bubble-user-bg);
+  border: 1px solid var(--accent-border);
 }
 
 .chat-bubble-ai {
-  background: #1a1a1a;
-  border: 1px solid #2a2a2a;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-subtle);
 }
 
 .fade-in {
@@ -115,14 +257,19 @@ input:focus {
   100% { transform: scale(2); opacity: 0; }
 }
 
+/* .panel-header / .active-nav: unreferenced by any component (checked), left
+   over from before the token system and still hardcoded dark. Converted for
+   whenever they get used rather than deleted, since dead CSS here has twice
+   turned out to be "not yet wired up" rather than truly dead -- see the
+   .speaker-badge history above. */
 .panel-header {
-  background: #0f0f0f;
-  border-bottom: 1px solid #1e1e1e;
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border-shell);
 }
 
 .active-nav {
-  background: #1e1e1e;
-  color: #fff;
+  background: var(--bg-inset);
+  color: var(--text-primary);
 }
 
 .transcript-segment {

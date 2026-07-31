@@ -10,7 +10,10 @@ import { transcribeLocal } from '../services/localAsr';
 interface AudioPanelProps {
   onTranscriptionComplete: (result: TranscriptionResult) => void;
   onPartialTranscription?: (result: TranscriptionResult) => void;
-  currentTime: number;
+  /** An explicit "jump to this time" command from elsewhere in the app (a
+   * transcript segment, an AI citation). Carries a nonce so two requests for
+   * the same or a nearby time are still distinct events -- see App.tsx. */
+  seekRequest?: { time: number; nonce: number } | null;
   onTimeUpdate: (time: number) => void;
   onAudioLoaded: (duration: number) => void;
   transcription: TranscriptionResult | null;
@@ -23,7 +26,7 @@ type ProcessingStep = 'idle' | 'uploading' | 'processing' | 'fetching' | 'done' 
 export default function AudioPanel({
   onTranscriptionComplete,
   onPartialTranscription,
-  currentTime,
+  seekRequest,
   onTimeUpdate,
   onAudioLoaded,
   transcription,
@@ -84,11 +87,21 @@ export default function AudioPanel({
       const barW = W / bars.length - 1;
       const progress = dur > 0 ? t / dur : 0;
 
+      // ctx.fillStyle needs a resolved colour string -- a canvas has no DOM
+      // node of its own for a Tailwind class or var() to attach to. Reading
+      // the CSS variable here (rather than hardcoding one colour) is what
+      // makes the waveform follow the theme toggle: this draw() runs on every
+      // animation frame regardless of playback state, so a theme flip is
+      // picked up on the very next frame with no extra listener needed.
+      const styles = getComputedStyle(canvas);
+      const playedColor = styles.getPropertyValue('--waveform-played').trim() || '#6366f1';
+      const unplayedColor = styles.getPropertyValue('--waveform-unplayed').trim() || '#2a2a2a';
+
       bars.forEach((val, i) => {
         const x = i * (barW + 1);
         const barH = val * H * 0.85;
         const y = (H - barH) / 2;
-        ctx.fillStyle = (i / bars.length) <= progress ? '#6366f1' : '#2a2a2a';
+        ctx.fillStyle = (i / bars.length) <= progress ? playedColor : unplayedColor;
         const radius = barW / 2;
         ctx.beginPath();
         ctx.roundRect(x, y, barW, barH, radius);
@@ -114,14 +127,22 @@ export default function AudioPanel({
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [waveformData]);
 
-  // Sync only genuine external seeks (from TranscriptPanel clicking a segment)
-  // Ignore updates that originated from our own onTimeUpdate to break the feedback loop
+  // Apply an explicit seek command. No threshold and no comparison against the
+  // current position: this fires only when something deliberately asked to
+  // jump, so there is no feedback loop with our own onTimeUpdate to guard
+  // against. Keying the effect on the nonce (not the time) is what lets a
+  // repeat click on the same segment, or a jump to a moment 0.2s away, work.
   useEffect(() => {
-    if (audioRef.current && Math.abs(currentTime - localTimeRef.current) > 0.5) {
-      audioRef.current.currentTime = currentTime;
-      localTimeRef.current = currentTime;
+    if (!seekRequest || !audioRef.current) return;
+    const t = Math.max(0, Math.min(durationRef.current || Infinity, seekRequest.time));
+    audioRef.current.currentTime = t;
+    localTimeRef.current = t;
+    // move the readouts immediately rather than waiting for the next frame,
+    // so a seek while paused is visible at once
+    if (progressFillRef.current && durationRef.current > 0) {
+      progressFillRef.current.style.width = `${(t / durationRef.current) * 100}%`;
     }
-  }, [currentTime]);
+  }, [seekRequest?.nonce]);
 
   const handleFileSelect = async (file: File) => {
     setAudioFile(file);
@@ -232,13 +253,13 @@ export default function AudioPanel({
   const rates = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
   return (
-    <div className="flex flex-col h-full bg-[#0f0f0f]">
+    <div className="flex flex-col h-full bg-[var(--bg-base)]">
       {/* Header */}
       <div className="panel-header px-4 py-3 flex items-center gap-2">
         <div className="w-7 h-7 rounded-lg bg-indigo-500/20 flex items-center justify-center">
           <Mic size={14} className="text-indigo-400" />
         </div>
-        <span className="text-sm font-semibold text-white">Audio Input</span>
+        <span className="text-sm font-semibold text-[var(--text-primary)]">Audio Input</span>
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -249,7 +270,7 @@ export default function AudioPanel({
               ? 'border-indigo-500 bg-indigo-500/10'
               : audioFile
               ? 'border-green-500/40 bg-green-500/5'
-              : 'border-[#2a2a2a] hover:border-[#3a3a3a] hover:bg-white/[0.02]'
+              : 'border-[var(--border-subtle)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-active)]'
           }`}
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={() => setIsDragging(false)}
@@ -269,23 +290,23 @@ export default function AudioPanel({
               <div className="w-10 h-10 bg-green-500/20 rounded-full flex items-center justify-center mx-auto">
                 <FileAudio size={20} className="text-green-400" />
               </div>
-              <p className="text-sm font-medium text-white truncate max-w-[180px] mx-auto">{audioFile.name}</p>
-              <p className="text-xs text-gray-500">{(audioFile.size / 1e6).toFixed(1)} MB</p>
+              <p className="text-sm font-medium text-[var(--text-primary)] truncate max-w-[180px] mx-auto">{audioFile.name}</p>
+              <p className="text-xs text-[var(--text-muted)]">{(audioFile.size / 1e6).toFixed(1)} MB</p>
             </div>
           ) : (
             <div className="space-y-2">
-              <div className="w-10 h-10 bg-[#1e1e1e] rounded-full flex items-center justify-center mx-auto">
-                <Upload size={20} className="text-gray-400" />
+              <div className="w-10 h-10 bg-[var(--bg-inset)] rounded-full flex items-center justify-center mx-auto">
+                <Upload size={20} className="text-[var(--text-secondary)]" />
               </div>
-              <p className="text-sm text-gray-300 font-medium">Drop audio or click to upload</p>
-              <p className="text-xs text-gray-500">MP3, WAV, M4A, FLAC, OGG, AAC</p>
+              <p className="text-sm text-[var(--text-secondary)] font-medium">Drop audio or click to upload</p>
+              <p className="text-xs text-[var(--text-muted)]">MP3, WAV, M4A, FLAC, OGG, AAC</p>
             </div>
           )}
         </div>
 
         {/* Audio Player */}
         {audioUrl && (
-          <div className="bg-[#161616] rounded-xl p-4 space-y-3 border border-[#222]">
+          <div className="bg-[var(--bg-inset)] rounded-xl p-4 space-y-3 border border-[var(--border-shell)]">
             <audio
               ref={audioRef}
               src={audioUrl}
@@ -313,7 +334,7 @@ export default function AudioPanel({
             {/* Progress bar */}
             <div
               ref={progressRef}
-              className="h-1.5 bg-[#2a2a2a] rounded-full cursor-pointer relative"
+              className="h-1.5 bg-[var(--border-subtle)] rounded-full cursor-pointer relative"
               onClick={handleProgressClick}
             >
               <div
@@ -326,7 +347,7 @@ export default function AudioPanel({
             </div>
 
             {/* Time */}
-            <div className="flex justify-between text-xs text-gray-500">
+            <div className="flex justify-between text-xs text-[var(--text-muted)]">
               <span ref={timeDisplayRef}>00:00</span>
               <span>{formatTime(duration)}</span>
             </div>
@@ -335,7 +356,7 @@ export default function AudioPanel({
             <div className="flex items-center justify-center gap-3">
               <button
                 onClick={() => skip(-10)}
-                className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+                className="w-8 h-8 flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
               >
                 <SkipBack size={16} />
               </button>
@@ -347,7 +368,7 @@ export default function AudioPanel({
               </button>
               <button
                 onClick={() => skip(10)}
-                className="w-8 h-8 flex items-center justify-center text-gray-400 hover:text-white transition-colors"
+                className="w-8 h-8 flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
               >
                 <SkipForward size={16} />
               </button>
@@ -361,7 +382,7 @@ export default function AudioPanel({
                   setIsMuted(next);
                   if (audioRef.current) audioRef.current.muted = next;
                 }}
-                className="text-gray-400 hover:text-white transition-colors"
+                className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
               >
                 {isMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
               </button>
@@ -386,7 +407,7 @@ export default function AudioPanel({
 
             {/* Playback speed */}
             <div className="flex items-center gap-2">
-              <span className="text-xs text-gray-500">Speed:</span>
+              <span className="text-xs text-[var(--text-muted)]">Speed:</span>
               <div className="flex gap-1 flex-wrap">
                 {rates.map(r => (
                   <button
@@ -398,7 +419,7 @@ export default function AudioPanel({
                     className={`text-xs px-2 py-0.5 rounded-md transition-colors ${
                       playbackRate === r
                         ? 'bg-indigo-500 text-white'
-                        : 'text-gray-400 hover:text-white bg-[#222] hover:bg-[#2a2a2a]'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] bg-[var(--border-shell)] hover:bg-[var(--border-subtle)]'
                     }`}
                   >
                     {r}x
@@ -411,13 +432,13 @@ export default function AudioPanel({
 
         {/* Processing Status */}
         {processingStep !== 'idle' && processingStep !== 'done' && processingStep !== 'error' && (
-          <div className="bg-[#161616] border border-[#222] rounded-xl p-4 space-y-3">
+          <div className="bg-[var(--bg-inset)] border border-[var(--border-shell)] rounded-xl p-4 space-y-3">
             <div className="flex items-center gap-2">
               <Loader2 size={14} className="text-indigo-400 animate-spin" />
-              <span className="text-xs text-gray-300 font-medium">Transcribing...</span>
+              <span className="text-xs text-[var(--text-secondary)] font-medium">Transcribing...</span>
             </div>
-            <p className="text-xs text-gray-500">{processingMsg}</p>
-            <div className="h-1 bg-[#2a2a2a] rounded-full overflow-hidden">
+            <p className="text-xs text-[var(--text-muted)]">{processingMsg}</p>
+            <div className="h-1 bg-[var(--border-subtle)] rounded-full overflow-hidden">
               <div
                 className="h-full bg-indigo-500 rounded-full progress-bar-fill"
                 style={{ width: `${processingProgress}%` }}
@@ -467,24 +488,24 @@ export default function AudioPanel({
 
         {/* Transcription Info */}
         {transcription && (
-          <div className="bg-[#161616] border border-[#222] rounded-xl p-3 space-y-2">
-            <p className="text-xs font-semibold text-gray-300">Last Transcription</p>
+          <div className="bg-[var(--bg-inset)] border border-[var(--border-shell)] rounded-xl p-3 space-y-2">
+            <p className="text-xs font-semibold text-[var(--text-secondary)]">Last Transcription</p>
             <div className="space-y-1">
               <div className="flex justify-between text-xs">
-                <span className="text-gray-500">File</span>
-                <span className="text-gray-300 truncate max-w-[120px]">{transcription.fileName}</span>
+                <span className="text-[var(--text-muted)]">File</span>
+                <span className="text-[var(--text-secondary)] truncate max-w-[120px]">{transcription.fileName}</span>
               </div>
               <div className="flex justify-between text-xs">
-                <span className="text-gray-500">Duration</span>
-                <span className="text-gray-300">{formatTime(transcription.duration)}</span>
+                <span className="text-[var(--text-muted)]">Duration</span>
+                <span className="text-[var(--text-secondary)]">{formatTime(transcription.duration)}</span>
               </div>
               <div className="flex justify-between text-xs">
-                <span className="text-gray-500">Speakers</span>
-                <span className="text-gray-300">{transcription.speakers.length} detected</span>
+                <span className="text-[var(--text-muted)]">Speakers</span>
+                <span className="text-[var(--text-secondary)]">{transcription.speakers.length} detected</span>
               </div>
               <div className="flex justify-between text-xs">
-                <span className="text-gray-500">Language</span>
-                <span className="text-gray-300">فارسی</span>
+                <span className="text-[var(--text-muted)]">Language</span>
+                <span className="text-[var(--text-secondary)]">فارسی</span>
               </div>
             </div>
           </div>

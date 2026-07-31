@@ -18,6 +18,7 @@ stream_chat(messages, transcript) and make_title(transcript).
 """
 import glob
 import os
+import sys
 import threading
 
 MLX_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
@@ -80,7 +81,34 @@ def _ensure():
             device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
         _TOK = AutoTokenizer.from_pretrained(HF_MODEL)
-        _MODEL = AutoModelForCausalLM.from_pretrained(HF_MODEL, torch_dtype=dtype).to(device)
+
+        # 8-bit weights roughly halve the footprint (~8GB fp16 -> ~4.5GB), which
+        # is what keeps this off the CUDA OOM line when Whisper and pyannote are
+        # also competing for the card. On by default on CUDA; CHAT_8BIT=0 opts
+        # back into fp16 if the accuracy or the speed matters more.
+        #
+        # Quantized loads must NOT be followed by .to(device): bitsandbytes
+        # places the weights itself through accelerate, and moving the module
+        # afterwards raises. Hence the separate device_map path below.
+        quant_cfg = None
+        if device == "cuda" and os.environ.get("CHAT_8BIT", "1") != "0":
+            try:
+                import bitsandbytes  # noqa: F401 -- availability probe only
+                from transformers import BitsAndBytesConfig
+                quant_cfg = BitsAndBytesConfig(load_in_8bit=True)
+            except Exception as e:
+                print(f"[chat] 8-bit requested but unavailable ({type(e).__name__}: {e}) -- "
+                      "falling back to fp16. Install bitsandbytes to halve the "
+                      "chat model's VRAM.", file=sys.stderr, flush=True)
+
+        if quant_cfg is not None:
+            _MODEL = AutoModelForCausalLM.from_pretrained(
+                HF_MODEL, quantization_config=quant_cfg, device_map={"": 0})
+            print("[chat] loaded in 8-bit on cuda", file=sys.stderr, flush=True)
+        else:
+            _MODEL = AutoModelForCausalLM.from_pretrained(
+                HF_MODEL, torch_dtype=dtype).to(device)
+            print(f"[chat] loaded in {dtype} on {device}", file=sys.stderr, flush=True)
         _MODEL.eval()
     return _MODEL, _TOK, _TMPL
 
@@ -123,8 +151,9 @@ def _system_prompt(transcript: str) -> str:
             "- Keep answers brief and to the point\n"
             "- Reference specific speakers (S1, S2, S3, …) when relevant\n"
             "- When you state something the transcript says, cite EXACTLY where by copying "
-            "that line's timestamp in brackets, e.g. [04:12] -- copy the digits verbatim from "
-            "the transcript, do not estimate or reformat them. This lets the user jump to and "
+            "that line's full bracket verbatim, e.g. [S1 04:12] -- copy it exactly as it "
+            "appears in the transcript above, speaker letter included; do not estimate, "
+            "reformat, or drop the speaker. This lets the user jump to and "
             "verify that moment, so include one whenever you reference a specific claim, "
             "decision, or quote -- not for general summaries with no single source line"
         )

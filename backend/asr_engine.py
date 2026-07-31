@@ -103,10 +103,19 @@ def _confidence(avg_logprob) -> "float | None":
         return None
 
 
-def transcribe_chunk(audio, sample_rate: int = 16000) -> list:
+def transcribe_chunk(audio, sample_rate: int = 16000, word_timestamps: bool = False) -> list:
     """Transcribe one audio chunk (float32 numpy array, `sample_rate` Hz).
-    Returns [{"start": float, "end": float, "text": str, "confidence": float|None}, ...],
-    timestamps relative to the start of this chunk."""
+    Returns [{"start": float, "end": float, "text": str, "confidence": float|None,
+    "words": [...]|None}, ...], timestamps relative to the start of this chunk.
+
+    With word_timestamps=True each segment carries a "words" list of
+    {"start", "end", "text"} with timings the model actually aligned, via
+    Whisper's cross-attention DTW. pipeline.py needs those to assign a speaker
+    per word; without them it can only label a whole segment at once, so a
+    segment spanning a speaker change gets one label for both people.
+
+    It is off by default because the alignment pass costs real time (~10-20%)
+    and only the diarizing path uses it."""
     _select()
     if _active == "mlx":
         import mlx_whisper
@@ -114,10 +123,18 @@ def transcribe_chunk(audio, sample_rate: int = 16000) -> list:
             audio, path_or_hf_repo=str(MLX_MODEL_DIR), language="fa", task="transcribe",
             temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0), compression_ratio_threshold=2.4,
             no_speech_threshold=0.45, condition_on_previous_text=False,
-            word_timestamps=False, verbose=None)
-        return [{"start": s["start"], "end": s["end"], "text": s["text"],
-                 "confidence": _confidence(s.get("avg_logprob"))}
-                for s in r.get("segments", [])]
+            word_timestamps=word_timestamps, verbose=None)
+        out = []
+        for s in r.get("segments", []):
+            # mlx_whisper returns dicts keyed "word"; faster-whisper uses .word
+            # on an object. Normalize to "text" here so pipeline.py sees one shape.
+            words = [{"start": round(w["start"], 3), "end": round(w["end"], 3),
+                      "text": w.get("word", "")}
+                     for w in (s.get("words") or [])] if word_timestamps else None
+            out.append({"start": s["start"], "end": s["end"], "text": s["text"],
+                        "confidence": _confidence(s.get("avg_logprob")),
+                        "words": words or None})
+        return out
 
     # ctranslate2 / faster-whisper -- pipeline.py already VAD-chunked the
     # audio, so vad_filter is off here to avoid re-segmenting a chunk that's
@@ -126,7 +143,12 @@ def transcribe_chunk(audio, sample_rate: int = 16000) -> list:
         audio, language="fa", task="transcribe", beam_size=5,
         temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0], compression_ratio_threshold=2.4,
         no_speech_threshold=0.45, condition_on_previous_text=False,
-        vad_filter=False, word_timestamps=False)
-    return [{"start": s.start, "end": s.end, "text": s.text,
-             "confidence": _confidence(getattr(s, "avg_logprob", None))}
-            for s in segments]
+        vad_filter=False, word_timestamps=word_timestamps)
+    out = []
+    for s in segments:
+        words = [{"start": round(w.start, 3), "end": round(w.end, 3), "text": w.word}
+                 for w in (getattr(s, "words", None) or [])] if word_timestamps else None
+        out.append({"start": s.start, "end": s.end, "text": s.text,
+                    "confidence": _confidence(getattr(s, "avg_logprob", None)),
+                    "words": words or None})
+    return out
