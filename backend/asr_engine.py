@@ -20,6 +20,7 @@ one explicitly with the ASR_BACKEND env var ("mlx" | "ctranslate2") if the
 auto-detection ever guesses wrong for your machine.
 """
 import os
+import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,10 @@ CT2_MODEL_DIR = Path(os.environ.get("CT2_MODEL_DIR", str(_REPO_ROOT / "models" /
 
 _ct2_model = None
 _active = None  # "mlx" | "ctranslate2", set on first use
+# Diagnostic snapshot of what _select() actually decided and why -- see
+# backend_info(). Populated as a side effect of _try_mlx()/_try_ctranslate2()
+# so a slow deploy can be checked (e.g. via /api/asr-status) without SSH+profiling.
+_device_info: dict = {}
 
 
 def _try_mlx() -> bool:
@@ -35,7 +40,10 @@ def _try_mlx() -> bool:
         import mlx_whisper  # noqa: F401 -- availability probe only
     except Exception:
         return False
-    return MLX_MODEL_DIR.exists()
+    if not MLX_MODEL_DIR.exists():
+        return False
+    _device_info.update(backend="mlx", device="metal", compute_type=None)
+    return True
 
 
 def _try_ctranslate2() -> bool:
@@ -43,13 +51,26 @@ def _try_ctranslate2() -> bool:
     try:
         from faster_whisper import WhisperModel
         import ctranslate2
-    except Exception:
+    except Exception as e:
+        print(f"[asr] faster-whisper/ctranslate2 not importable: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
         return False
     if not CT2_MODEL_DIR.exists():
+        print(f"[asr] CT2 model dir not found: {CT2_MODEL_DIR}", file=sys.stderr, flush=True)
         return False
     try:
         cuda_count = ctranslate2.get_cuda_device_count()
-    except Exception:
+    except Exception as e:
+        # This is the single most common way "GPU present, but everything is
+        # slow" happens with zero other symptoms: ctranslate2 bundles its own
+        # CUDA runtime, separate from PyTorch's, and can fail to find a
+        # compatible cuDNN/cuBLAS on Windows (driver/toolkit mismatch, missing
+        # MSVC redistributables) without raising past this call -- it just
+        # reports 0 devices, and this used to fall back to CPU with nothing in
+        # the log to say why. Logging the exception IS the fix for "why is
+        # this on CPU".
+        print(f"[asr] ctranslate2.get_cuda_device_count() failed: "
+              f"{type(e).__name__}: {e} -- falling back to CPU", file=sys.stderr, flush=True)
         cuda_count = 0
     device = "cuda" if cuda_count > 0 else "cpu"
     if device == "cuda":
@@ -61,7 +82,11 @@ def _try_ctranslate2() -> bool:
         compute_type = os.environ.get("CT2_COMPUTE_TYPE", "int8_float16")
     else:
         compute_type = os.environ.get("CT2_COMPUTE_TYPE", "int8")
+    print(f"[asr] ctranslate2 selecting device={device} compute_type={compute_type} "
+          f"(cuda_device_count={cuda_count})", file=sys.stderr, flush=True)
     _ct2_model = WhisperModel(str(CT2_MODEL_DIR), device=device, compute_type=compute_type)
+    _device_info.update(backend="ctranslate2", device=device, compute_type=compute_type,
+                        cuda_device_count=cuda_count)
     return True
 
 
@@ -86,6 +111,16 @@ def _select():
 def active_backend() -> str:
     _select()
     return _active
+
+
+def backend_info() -> dict:
+    """Diagnostic snapshot of which ASR backend/device/compute_type actually
+    got selected -- call active_backend() (or transcribe once) first if this
+    returns {"loaded": False}; it deliberately does not force a load itself,
+    same reasoning as pipeline.model_dir()/model_available()."""
+    if _active is None:
+        return {"loaded": False}
+    return {"loaded": True, **_device_info}
 
 
 def _confidence(avg_logprob) -> "float | None":

@@ -113,6 +113,15 @@ def health():
             "gpt_correct_available": bool(os.environ.get("OPENAI_API_KEY"))}
 
 
+@app.get("/api/asr-status")
+def asr_status():
+    """Diagnostic: loads the ASR backend right now (same code path used
+    during transcription) and reports the actual device/compute_type it
+    landed on -- the fastest way to check "GPU memory is used but everything
+    is slow" without SSH+profiling. See pipeline.asr_diagnostic()."""
+    return pipeline.asr_diagnostic()
+
+
 @app.get("/api/diarizer-status")
 def diarizer_status():
     """Diagnostic: attempts to load pyannote 3.1 right now (same code path

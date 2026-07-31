@@ -75,6 +75,18 @@ def model_available() -> bool:
     return asr_engine.MLX_MODEL_DIR.exists() or asr_engine.CT2_MODEL_DIR.exists()
 
 
+def asr_diagnostic() -> dict:
+    """Diagnostic: loads the ASR backend right now (same code path used
+    during transcription) and reports which device/compute_type it actually
+    landed on. The single most useful check for "GPU memory is used but
+    everything is slow" -- ctranslate2's CUDA detection can fail silently on
+    Windows and fall back to CPU with no other visible symptom; see
+    asr_engine._try_ctranslate2()."""
+    import asr_engine
+    backend = asr_engine.active_backend()
+    return {"backend": backend, **asr_engine.backend_info()}
+
+
 _ENCODER = None
 _NORMALIZER = None
 _PYANNOTE = None
@@ -165,17 +177,48 @@ def _vad_segments(audio):
         return_seconds=False)
 
 
+def _split_long(start, end, tgt):
+    """Hard-split a single span into <=tgt pieces.
+
+    A VAD segment can itself be longer than target_s -- fast or overlapping
+    conversation with no >=300ms gap for a long stretch produces exactly one
+    giant "speech" region (min_silence_duration_ms=300 never fires). Handing
+    that whole span to Whisper in one call feeds it more audio than a single
+    ~30s decode window, so the backend has to slide its window forward
+    internally. With condition_on_previous_text=False (needed to stop
+    in-window repetition loops) the model has no memory of what it already
+    transcribed, and its own window-advance heuristic -- driven by predicted
+    end/timestamp tokens, less reliable on this fine-tuned non-English model
+    -- can fail to advance and re-decode audio it already covered: two
+    independently-generated, near-identical (not byte-identical) copies of
+    the same speech, each with its own slightly different word timings, so
+    they can even get diarized to different speakers. Hard-slicing here keeps
+    every chunk within one decode window, at the cost of occasionally cutting
+    a chunk boundary mid-word -- the same trade-off already made at every
+    VAD-segment boundary elsewhere in this function."""
+    if end - start <= tgt:
+        return [(start, end)]
+    pieces, s = [], start
+    while s < end:
+        e = min(s + tgt, end)
+        pieces.append((s, e))
+        s = e
+    return pieces
+
+
 def _asr_chunks(segs, target_s=24.0):
-    """Merge VAD segments into <=target_s chunks (good context for Whisper)."""
+    """Merge VAD segments into <=target_s chunks (good context for Whisper),
+    first hard-splitting any single segment that already exceeds target_s."""
     if not segs:
         return []
     tgt = int(target_s * SAMPLE_RATE)
-    chunks, cs, ce = [], segs[0]["start"], segs[0]["end"]
-    for seg in segs[1:]:
-        if seg["end"] - cs <= tgt:
-            ce = seg["end"]
+    pieces = [p for seg in segs for p in _split_long(seg["start"], seg["end"], tgt)]
+    chunks, cs, ce = [], pieces[0][0], pieces[0][1]
+    for s, e in pieces[1:]:
+        if e - cs <= tgt:
+            ce = e
         else:
-            chunks.append((cs, ce)); cs, ce = seg["start"], seg["end"]
+            chunks.append((cs, ce)); cs, ce = s, e
     chunks.append((cs, ce))
     return chunks
 
