@@ -78,6 +78,16 @@ WORD_LEVEL_DIARIZATION = os.environ.get("DIARIZE_WORD_LEVEL", "1") != "0"
 # absorption below only fires on the same-speaker-both-sides pattern.
 SANDWICH_WORDS = int(os.environ.get("DIARIZE_SANDWICH_WORDS", "0"))
 
+# Cut ASR chunks at diarization turn boundaries so each chunk holds exactly one
+# speaker (see _speaker_chunks). 0 = chunk by VAD alone and reconcile speakers
+# per word afterwards, the older behaviour.
+SPEAKER_AWARE_CHUNKS = os.environ.get("ASR_SPEAKER_CHUNKS", "1") != "0"
+
+# Shortest chunk worth sending to Whisper on its own. Below this a "turn" is
+# almost always a boundary sliver, and isolated sub-second audio decodes to
+# noise or nothing.
+MIN_CHUNK_S = float(os.environ.get("ASR_MIN_CHUNK_S", "0.5"))
+
 
 def model_dir() -> Path:
     """Best-guess directory of the ASR model that will be used -- mirrors
@@ -230,6 +240,71 @@ def _split_long(start, end, tgt):
         pieces.append((s, e))
         s = e
     return pieces
+
+
+def _speaker_chunks(segs, index, target_s=24.0):
+    """VAD speech cut at diarization turn boundaries, then merged back within
+    a single speaker up to target_s. Returns [(start, end, speaker), ...].
+
+    The pipeline used to chunk purely by VAD and only reconcile speakers
+    afterwards, per word. That has two costs, and the second is the one that
+    shows up in the transcript:
+
+      1. Whisper is handed audio containing a speaker change and asked to
+         decode it as one continuous utterance -- different voice, different
+         prosody, often mid-sentence. It is being fed something it was not
+         trained to model.
+      2. Recovering the boundary afterwards depends on word timestamps landing
+         on the right side of it. They frequently do not: a handover can be
+         sub-word, and _split_on_speaker then absorbs the short side into its
+         neighbour as if it were jitter. On the scored sample, one emitted
+         segment covered two reference speakers for exactly this reason.
+
+    Cutting first makes each chunk single-speaker by construction: Whisper
+    gets clean audio, and the speaker label is known rather than inferred, so
+    no word-level alignment pass is needed for it either.
+
+    The trade is that a diarization error is now baked in -- there is no later
+    word-level step that could partially recover from it. That is the right
+    trade only because the labels come from community-1's exclusive
+    diarization; set ASR_SPEAKER_CHUNKS=0 to go back to VAD-only chunking."""
+    if not segs or not index:
+        return []
+    tgt = int(target_s * SAMPLE_RATE)
+    min_len = int(MIN_CHUNK_S * SAMPLE_RATE)
+
+    # every turn edge is a candidate cut point
+    bounds = sorted({int(round(v * SAMPLE_RATE))
+                     for t in index.turns for v in (t[0], t[1])})
+    pieces = []
+    for seg in segs:
+        s, e = int(seg["start"]), int(seg["end"])
+        lo, hi = bisect.bisect_right(bounds, s), bisect.bisect_left(bounds, e)
+        cuts = [s] + bounds[lo:hi] + [e]
+        for a, b in zip(cuts, cuts[1:]):
+            if b > a:
+                pieces.append([a, b, index.assign(a / SAMPLE_RATE, b / SAMPLE_RATE)])
+    if not pieces:
+        return []
+
+    merged = []
+    for a, b, spk in pieces:
+        if merged:
+            prev = merged[-1]
+            # A piece too short to transcribe on its own is a turn-boundary
+            # sliver, not a turn. Sending Whisper 0.2s of audio yields noise or
+            # nothing, so hand it to the neighbour it is already touching.
+            if b - a < min_len and prev[2] != spk:
+                prev[1] = b
+                continue
+            if prev[2] == spk and b - prev[0] <= tgt:
+                prev[1] = b
+                continue
+        merged.append([a, b, spk])
+
+    # a single speaker can still hold the floor for longer than one decode
+    # window -- same hard split as the VAD-only path
+    return [(x, y, spk) for a, b, spk in merged for x, y in _split_long(a, b, tgt)]
 
 
 def _asr_chunks(segs, target_s=24.0):
@@ -787,7 +862,10 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
     vad = _vad_segments(audio)
     if not vad:
         vad = [{"start": 0, "end": len(audio)}]
-    chunks = _asr_chunks(vad)
+
+    # NOTE: chunking now happens AFTER diarization (see below) so the chunk
+    # boundaries can be aligned to speaker turns. It used to run here, which
+    # forced every speaker boundary to be recovered per-word after the fact.
 
     # diarization runs independently of the ASR chunking. `diarizer_used`
     # tracks what ACTUALLY produced `turns` this run (not inferred from
@@ -831,6 +909,17 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
         else:
             _free_gpu()
 
+    # Chunk for ASR. With diarization available, cut at speaker boundaries so
+    # each chunk carries exactly one speaker; otherwise fall back to VAD-only
+    # chunks with no speaker attached.
+    if turns and SPEAKER_AWARE_CHUNKS:
+        chunks = _speaker_chunks(vad, turns)
+        print(f"[asr] {len(chunks)} speaker-aligned chunks", file=sys.stderr, flush=True)
+    else:
+        chunks = [(a, b, None) for a, b in _asr_chunks(vad)]
+        print(f"[asr] {len(chunks)} VAD chunks (no speaker alignment)",
+              file=sys.stderr, flush=True)
+
     # transcribe chunk-by-chunk, assigning the speaker (by overlap) and emitting
     # each finished segment immediately so the UI can stream the transcript.
     label_map, segments = {}, []
@@ -841,15 +930,17 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
     # neighbour came from a different transcribe_chunk() call entirely
     carry_label, carry_count = None, 0
     n = len(chunks)
-    for i, (a, b) in enumerate(chunks):
+    for i, (a, b, chunk_spk) in enumerate(chunks):
         _log(f"Transcribing {i+1}/{n}…", progress)
         if b - a < int(0.1 * SAMPLE_RATE):
             continue
         # Word timestamps cost an extra alignment pass, so only pay for them
-        # when diarization can actually use them to split a segment.
+        # when diarization can actually use them to split a segment -- which a
+        # speaker-aligned chunk never needs, since its speaker is already known.
         chunk_segments = asr_engine.transcribe_chunk(
             audio[a:b], SAMPLE_RATE,
-            word_timestamps=bool(turns) and WORD_LEVEL_DIARIZATION)
+            word_timestamps=(bool(turns) and WORD_LEVEL_DIARIZATION
+                             and chunk_spk is None))
         chunk_segments = _dedupe_repeats(chunk_segments)
         off = a / SAMPLE_RATE
 
@@ -886,6 +977,12 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
             if not raw:
                 continue
             st, en = round(off + s["start"], 2), round(off + s["end"], 2)
+            if chunk_spk is not None:
+                # speaker-aligned chunk: the label is known by construction,
+                # so there is nothing to infer and nothing to split
+                _emit(chunk_spk, st, en, raw, None, s.get("confidence"))
+                carry_label, carry_count = chunk_spk, len(raw.split())
+                continue
             if not turns:
                 _emit("SPK0", st, en, raw, None, s.get("confidence"))
                 continue

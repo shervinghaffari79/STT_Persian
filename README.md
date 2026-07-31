@@ -234,6 +234,39 @@ If speakers are still being merged, set `PYANNOTE_NUM_SPEAKERS` when you know
 the headcount — it tells clustering the answer instead of asking it to infer
 one, and outperforms any threshold tuning.
 
+### Measuring quality (don't eyeball it)
+
+```bash
+python backend/evaluate.py ground_truth.txt exported_transcript.txt
+```
+
+Reports WER/CER after Persian-aware normalization (yeh/kaf folding, ZWNJ,
+diacritics, punctuation) plus an insertion/deletion/substitution split, and
+compares speaker counts. The reference format is alternating `Speaker N` lines
+and their text; the prediction is this backend's `[S1]: …` export. A partial
+export is scored against the best-matching prefix of the reference, and the
+covered fraction is printed — check it before trusting the number.
+
+**Read the I/D/S split, not just the WER.** A duplicated segment and a genuine
+accuracy regression both raise WER, but they have opposite fixes: duplication
+shows up as insertions with substitutions flat. On the first scored sample,
+one duplicated segment accounted for **54.3% → 34.3% WER** and **33.8% → 14.7%
+CER** on its own.
+
+### Speaker-aligned ASR chunking
+
+With diarization available, ASR chunks are cut at speaker-turn boundaries so
+each chunk contains exactly one speaker (`_speaker_chunks`). Previously chunks
+came from VAD alone and speakers were reconciled per word afterwards, which
+meant Whisper decoded across speaker changes as if they were one utterance and
+the boundary had to be recovered from word timestamps — on the scored sample a
+single emitted segment covered two reference speakers that way.
+
+The trade-off: a diarization error is now baked in, with no later word-level
+step that could partly recover from it. Set `ASR_SPEAKER_CHUNKS=0` to return to
+VAD-only chunking. Sub-`ASR_MIN_CHUNK_S` slivers at turn boundaries are folded
+into their neighbour rather than sent to Whisper alone.
+
 ### ASR speed/accuracy knobs
 
 Decode cost is dominated by beam width and by the temperature-fallback ladder:
@@ -246,7 +279,9 @@ check for it before trading accuracy for speed.
 |---|---|---|
 | `WHISPER_BEAM_SIZE` | `5` | `1` (greedy) is the largest single ASR speedup, at some WER cost |
 | `WHISPER_TEMPERATURES` | `0.0,0.2,0.4,0.6,0.8,1.0` | Shorten to cap worst-case re-decoding |
-| `DIARIZE_WORD_LEVEL` | `1` | `0` skips Whisper's word-alignment pass (~10–20% faster, coarser speaker splits) |
+| `DIARIZE_WORD_LEVEL` | `1` | `0` skips Whisper's word-alignment pass (~10–20% faster, coarser speaker splits). Unused when speaker-aligned chunking is on — the label is already known |
+| `ASR_SPEAKER_CHUNKS` | `1` | `0` reverts to VAD-only chunks + per-word speaker reconciliation |
+| `ASR_MIN_CHUNK_S` | `0.5` | Shortest standalone chunk; shorter turn slivers fold into a neighbour |
 | `DEDUPE_THRESHOLD` | `0.6` | Similarity above which an adjacent repeated segment is dropped |
 | `CT2_COMPUTE_TYPE` | `int8_float16` on CUDA | Override the compute type |
 
