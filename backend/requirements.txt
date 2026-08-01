@@ -31,6 +31,12 @@ mlx-lm               # runs Qwen3-4B-Instruct-2507-4bit on the GPU
 # NVIDIA GPU is present, else CPU):
 # torch + transformers below also cover this -- accelerate speeds up GPU loading
 accelerate
+# 8-bit chat weights (CHAT_8BIT, on by default on CUDA). Without this the chat
+# model loads in fp16 (~8GB instead of ~5GB) and a 16GB card cannot hold
+# Whisper + pyannote + chat at once. chat.py logs "[chat] 8-bit requested but
+# unavailable" and falls back to fp16 rather than failing, so a missing
+# bitsandbytes shows up as an OOM later rather than an install error here.
+bitsandbytes
 # Windows/Linux run Qwen/Qwen3.5-4B (see backend/chat.py), whose "qwen3_5"
 # model_type may not exist yet in a stable transformers release -- its own
 # model card says to install from `main`. `>=4.37` is NOT sufficient for it;

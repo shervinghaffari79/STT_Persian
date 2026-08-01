@@ -177,42 +177,6 @@ def _unload_pyannote():
     print("[mem] unloaded pyannote after diarization", file=sys.stderr, flush=True)
 
 
-def free_for_chat() -> list:
-    """Release the transcription models so the chat LLM has room.
-
-    The mirror image of what server.py already does before a transcription
-    (chat.unload()). Both directions are needed on a 16GB card: Whisper's
-    CTranslate2 weights plus pyannote plus an unquantized 4B chat model do not
-    fit together, and nothing here is needed while a chat reply is generating.
-
-    Returns the names of what was actually freed, for logging. Everything
-    reloads lazily on the next transcription."""
-    freed = []
-    # pyannote first: it is pure PyTorch, so releasing it is thread-safe and
-    # has no native teardown to go wrong. It is also sufficient on its own --
-    # the OOM this exists for was short by 250 MiB, and dropping pyannote frees
-    # well over a gigabyte. Whisper is left alone by default; see
-    # asr_engine.unload() for why touching it is opt-in.
-    try:
-        import asr_engine
-        if asr_engine.unload():
-            freed.append("whisper")
-    except Exception as e:
-        print(f"[mem] could not unload Whisper: {type(e).__name__}: {e}",
-              file=sys.stderr, flush=True)
-    global _PYANNOTE, _PYANNOTE_TRIED
-    if _PYANNOTE is not None:
-        with _PYANNOTE_LOCK:
-            if _PYANNOTE is not None:
-                _PYANNOTE = None
-                _PYANNOTE_TRIED = False   # allow a reload on the next job
-                freed.append("pyannote")
-    import gc
-    gc.collect()
-    _free_gpu()
-    return freed
-
-
 def gpu_report() -> dict:
     """What is actually on the card right now.
 

@@ -51,9 +51,8 @@ app.add_middleware(
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
-# Number of transcriptions currently running. Chat frees the ASR/diarization
-# models to make room for itself (see _free_gpu_for_chat), which must never
-# happen underneath a job that is mid-transcription.
+# Number of transcriptions currently running. Reported by /api/gpu-status so a
+# VRAM reading can be interpreted (a job in flight holds ASR + diarization).
 _ACTIVE_JOBS = 0
 _ACTIVE_LOCK = threading.Lock()
 
@@ -63,42 +62,6 @@ def _job_delta(n: int) -> int:
     with _ACTIVE_LOCK:
         _ACTIVE_JOBS += n
         return _ACTIVE_JOBS
-
-
-def _free_gpu_for_chat():
-    """Drop Whisper + pyannote before generating a chat reply.
-
-    server.py has always called chat.unload() before a transcription, but
-    nothing did the reverse, so on a 16GB card the chat model had to fit in
-    whatever ASR and diarization left behind -- roughly 4.1 GiB of CTranslate2
-    (invisible to PyTorch) plus pyannote. An unquantized 4B chat model does not
-    fit in the remainder, which is the reported OOM. Both models reload lazily
-    on the next job.
-
-    Best-effort by construction: this is a memory OPTIMIZATION, so any failure
-    in it must degrade to "chat runs with less VRAM", never to a failed
-    request. It is called before the streaming generator starts, so an
-    exception escaping here would surface as a bare 500 on /api/chat with the
-    real cause only in the server console -- the chat would fail for a reason
-    that has nothing to do with chat."""
-    try:
-        with _ACTIVE_LOCK:
-            busy = _ACTIVE_JOBS
-        if busy:
-            # Freeing now would yank the models out from under a running
-            # transcription. Let chat try anyway -- it may still fit, and if it
-            # does not the OOM handler reports something actionable.
-            print(f"[mem] {busy} transcription(s) running -- not freeing ASR models "
-                  "for chat; chat may be short on VRAM until they finish", flush=True)
-            return
-        freed = pipeline.free_for_chat()
-        if freed:
-            print(f"[mem] freed {' + '.join(freed)} to make room for the chat model",
-                  flush=True)
-    except Exception as e:
-        traceback.print_exc()
-        print(f"[mem] could not free GPU memory for chat ({type(e).__name__}: {e}) -- "
-              "continuing anyway; chat may be short on VRAM", flush=True)
 
 
 def _set(job_id, **kw):
@@ -147,11 +110,12 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
         # register the live list itself; on_segment appends to it in place
         _set(job_id, state="processing", progress=2, message="Starting…",
              partial=partial, speakers=[])
-        # The chat LLM caches ~9GB of fp16 weights for the process lifetime once
-        # the AI Analysis panel has been used. On a 16GB card that is what turns
-        # a long file into a CUDA OOM -- ASR + diarization are left under half
-        # the board. Drop it here; the next /api/chat request reloads it lazily.
-        # (_free_gpu_for_chat is the mirror of this, run before chat replies.)
+        # The chat LLM is cached for the process lifetime once the AI Analysis
+        # panel has been used. Dropping it before a transcription is the ONE
+        # unload this backend still does, and it predates the chat-side
+        # swapping that was removed: it is cheap, it has never misbehaved, and
+        # it keeps a long file from competing with the chat model. The next
+        # /api/chat request reloads it lazily.
         if chat.unload():
             print("[mem] unloaded chat model to free GPU for transcription", flush=True)
         result = pipeline.transcribe(tmp_path, diarize=diarize, progress=progress,
@@ -342,9 +306,6 @@ async def chat_stream(req: Request):
         messages = body.get("messages", [])
         transcript = body.get("transcript", "") or ""
 
-        # off the event loop: model teardown is blocking, and doing it on the
-        # loop thread stalls every other request the way the upload handler did
-        await run_in_threadpool(_free_gpu_for_chat)
     except Exception as e:
         traceback.print_exc()
         detail = f"{type(e).__name__}: {e}"
@@ -400,7 +361,6 @@ async def chat_stream(req: Request):
 @app.post("/api/chat/title")
 async def chat_title(req: Request):
     body = await req.json()
-    await run_in_threadpool(_free_gpu_for_chat)
     try:
         return {"title": chat.make_title(body.get("transcript", "") or "")}
     except Exception as e:
