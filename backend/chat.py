@@ -22,16 +22,39 @@ import sys
 import threading
 
 MLX_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-# NOT "Qwen/Qwen3.5-4B" -- that is a DIFFERENT, newer model: a
-# vision-language model (architectures: ["Qwen3_5ForConditionalGeneration"],
-# a full ViT vision tower, image/video token ids in its config.json), loaded
-# here with AutoModelForCausalLM, the wrong model class for it. It is also a
-# hybrid linear-attention architecture, materially heavier per token than the
-# plain Qwen3-4B-Instruct-2507 the MLX backend (and the README) actually
-# promise. Whatever HF_MODEL resolves to, it should be the SAME model as
-# MLX_MODEL above -- Windows and Mac are supposed to run identical model
-# behavior on different runtimes, not different models.
-HF_MODEL = os.environ.get("HF_CHAT_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+# Windows/Linux intentionally run a DIFFERENT (newer) chat model than the Mac
+# MLX path: Qwen3.5-4B, not Qwen3-4B-Instruct-2507. That is a deliberate
+# choice, not a mismatch to "fix" back to matching MLX_MODEL.
+#
+# Qwen3.5-4B's own config.json declares architectures:
+# ["Qwen3_5ForConditionalGeneration"] (the vision-language class) plus a full
+# vision_config -- but that field is metadata, not what AutoModelForCausalLM
+# actually loads: transformers' MODEL_FOR_CAUSAL_LM_MAPPING registers
+# "qwen3_5" -> Qwen3_5ForCausalLM, a dedicated text-only class
+# (_keys_to_ignore_on_load_unexpected = ["^model.visual.*", "^mtp.*"]) that
+# never instantiates the vision tower. AutoModelForCausalLM.from_pretrained()
+# below is therefore already correct -- do not change it to a vision/VLM auto
+# class, and do not assume the vision weights cost anything at inference time.
+#
+# What genuinely needs care with this model (see _ensure() and stream_chat()):
+#   1. It requires a transformers version that registers "qwen3_5" -- per its
+#      own model card, that means installing from the `main` branch, not a
+#      pip release pinned by a `>=` floor. An unsupporting transformers fails
+#      the FIRST from_pretrained() call outright.
+#   2. It thinks by default (emits a <think>...</think> block before every
+#      reply, recommended up to 32k-80k tokens for hard tasks per its model
+#      card) unless enable_thinking=False is honoured by the chat template.
+#      If that silently stops working, every reply pays for a full hidden
+#      reasoning pass -- which reads exactly like "processing got slower".
+HF_MODEL = os.environ.get("HF_CHAT_MODEL", "Qwen/Qwen3.5-4B")
+
+# "qwen3_5" landing in a stable transformers release lags this model's launch;
+# many deployments will only have it via `pip install
+# "transformers @ git+https://github.com/huggingface/transformers.git@main"`
+# (see the model card). Checked once in _ensure() so a mismatch fails with an
+# actionable message instead of a bare "Unrecognized configuration class"
+# traceback from deep inside from_pretrained().
+_REQUIRED_MODEL_TYPE = "qwen3_5"
 _SNAP_GLOB = "models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/*/chat_template.jinja"
 
 _active = None  # "mlx" | "transformers"
@@ -81,7 +104,30 @@ def _ensure():
         _device_info.update(backend="mlx", model=MLX_MODEL, device="metal", quantization="4bit")
     else:
         import torch
+        import transformers
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        # Only probe for qwen3_5 support when HF_MODEL actually looks like a
+        # Qwen3.5-family checkpoint -- HF_CHAT_MODEL can be pointed at anything,
+        # and this check would otherwise misfire on an unrelated model.
+        looks_qwen35 = "qwen3.5" in HF_MODEL.lower() or "qwen3_5" in HF_MODEL.lower()
+        supported = None
+        if looks_qwen35:
+            try:
+                from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+                supported = _REQUIRED_MODEL_TYPE in CONFIG_MAPPING
+            except Exception:
+                pass  # couldn't even check -- let from_pretrained() speak for itself
+        if supported is False:
+            raise RuntimeError(
+                f"installed transformers ({transformers.__version__}) does not "
+                f"recognize model_type={_REQUIRED_MODEL_TYPE!r}, which {HF_MODEL} "
+                "requires. This model shipped ahead of a stable transformers "
+                "release that supports it -- install from main:\n"
+                '  pip install "transformers[serving] @ '
+                'git+https://github.com/huggingface/transformers.git@main"\n'
+                "(also needs torchvision and pillow present, even for text-only "
+                "use -- see the model card's Transformers quickstart). Or pin "
+                "HF_CHAT_MODEL to a model your installed transformers supports.")
         # CHAT_DEVICE forces cpu on a GPU box: the 4B fp16 weights are ~8GB, and
         # on a 16GB card that is more than half the board held for a panel that
         # is used on demand. CPU generation is much slower but leaves the GPU
@@ -256,6 +302,42 @@ def _fit_to_context(tok, messages, transcript, max_new_tokens, max_ctx):
     return _build_messages(trimmed, t)
 
 
+def _check_thinking_leak(tok, output_ids, prompt_len):
+    """Confirm enable_thinking=False actually suppressed Qwen3.5's default
+    <think>...</think> reasoning block -- and say so loudly if it didn't.
+
+    If this silently stops working (a template change, a version mismatch
+    between the cached chat_template.jinja and the installed transformers),
+    every reply pays for a full hidden reasoning pass -- the model card
+    recommends up to 32k-80k tokens for hard tasks -- while
+    TextIteratorStreamer's skip_special_tokens=True means the client-visible
+    stream shows nothing wrong: no error, no visible <think> tag, just a
+    reply that takes much longer to arrive. That is precisely "the chat got
+    slower, no error, nothing visibly different" from the outside, so this
+    decodes the raw output once per response (cheap relative to the
+    generation that already happened) purely to make that failure mode loud
+    instead of invisible."""
+    try:
+        gen_ids = output_ids[0][prompt_len:]
+        text = tok.decode(gen_ids, skip_special_tokens=False)
+    except Exception:
+        return
+    if "<think>" not in text:
+        return
+    body = text.split("<think>", 1)[1]
+    body = body.split("</think>", 1)[0] if "</think>" in body else body
+    try:
+        n = len(tok.encode(body, add_special_tokens=False)) if body else 0
+    except Exception:
+        n = None
+    print(f"[chat] enable_thinking=False did NOT suppress a <think> block "
+         f"({'~' + str(n) if n is not None else 'unknown'} hidden tokens "
+         "generated) -- this response paid for a full reasoning pass that "
+         "never reaches the client. Suspect a chat_template.jinja / "
+         "transformers version mismatch; see Qwen3.5's model card, "
+         "'Instruct (or Non-Thinking) Mode'.", file=sys.stderr, flush=True)
+
+
 def stream_chat(messages, transcript="", max_tokens=1024, temperature=0.7):
     """Yield generated Persian text token-by-token, on whichever backend is active."""
     model, tok, tmpl = _ensure()
@@ -291,10 +373,11 @@ def stream_chat(messages, transcript="", max_tokens=1024, temperature=0.7):
     # few questions, have to start a new conversation": the request never
     # completes, so there is nothing for the client to time out on either.
     error: list = []
+    raw_output: list = []
 
     def _run():
         try:
-            model.generate(**gen_kwargs)
+            raw_output.append(model.generate(**gen_kwargs))
         except Exception as e:
             error.append(e)
             streamer.end()
@@ -307,6 +390,8 @@ def stream_chat(messages, transcript="", max_tokens=1024, temperature=0.7):
     thread.join()
     if error:
         raise RuntimeError(f"generation failed: {error[0]}") from error[0]
+    if raw_output:
+        _check_thinking_leak(tok, raw_output[0], inputs["input_ids"].shape[-1])
 
 
 def make_title(transcript: str) -> str:

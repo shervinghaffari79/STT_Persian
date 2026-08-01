@@ -50,7 +50,7 @@ on `/api/transcribe`; it's a no-op if the key isn't set.
   merges are stored as reversible redirects, never rewriting the original
   segments
 - ⏱️ **Timestamped segments** with per-word timings; export to SRT / TXT / JSON
-- 🤖 **AI analysis panel** — chat over the transcript with a **local Qwen3-4B (MLX)** model (streamed, on-device, no cloud)
+- 🤖 **AI analysis panel** — chat over the transcript with a **local Qwen3 chat model** (MLX `Qwen3-4B-Instruct-2507` on Mac, `Qwen3.5-4B` on Windows/Linux — see [Windows Server deployment](#-windows-server--nvidia-gpu-deployment)), streamed, on-device, no cloud
 - 🎨 **Modern, responsive UI** (React + Tailwind + Vite) with a **dark/light theme toggle** (follows OS preference until you pick one explicitly, then remembers it)
 
 ## 🏗️ Architecture
@@ -109,14 +109,14 @@ The frontend proxies `/api/*` to the backend (see `vite.config.ts`).
 |---|---|---|
 | `POST` | `/api/transcribe` | multipart `file` (+ `diarize=true\|false`, `gpt_correct=true\|false`) → `{ job_id }` |
 | `GET` | `/api/status/{job_id}` | `{ state, progress, message, result? }` |
-| `POST` | `/api/chat` | `{ messages, transcript }` → streamed Persian reply (local Qwen3-4B) |
+| `POST` | `/api/chat` | `{ messages, transcript }` → streamed Persian reply (local Qwen3 chat model) |
 | `POST` | `/api/chat/title` | `{ transcript }` → `{ title }` |
 | `GET` | `/api/health` | model presence check (`gpt_correct_available` reflects whether `OPENAI_API_KEY` is set) |
 | `GET` | `/api/asr-status` | loads the ASR backend now, reports actual device/compute_type (e.g. confirms CUDA isn't silently falling back to CPU) |
 | `GET` | `/api/chat-status` | loads the chat LLM now, reports actual model/device/quantization -- "which language model is loaded" answered directly |
 | `GET` | `/api/diarizer-status` | loads pyannote now, reports which pipeline (community-1 / 3.1) and whether exclusive diarization is active |
 
-The ASR (Whisper) and chat (Qwen3-4B) models run entirely locally — on MLX/Metal
+The ASR (Whisper) and chat (Qwen3) models run entirely locally — on MLX/Metal
 on a Mac, or CTranslate2/`transformers` on CUDA/CPU elsewhere — nothing is sent
 to any external API for those. The one optional exception is the per-segment
 GPT cleanup pass above, which sends only that segment's already-transcribed
@@ -132,19 +132,48 @@ same API, same pipeline, no code changes needed:
 | | macOS (Apple Silicon) | Windows / Linux |
 |---|---|---|
 | ASR | MLX Whisper (Metal GPU) | faster-whisper/CTranslate2 (CUDA if present, else CPU int8) |
-| Chat | MLX (`mlx-lm`) | `transformers` (CUDA if present, else CPU) |
+| Chat | MLX (`mlx-lm`), `Qwen3-4B-Instruct-2507` | `transformers`, `Qwen/Qwen3.5-4B` (CUDA if present, else CPU) |
+
+Windows/Linux intentionally run a **different, newer** chat model
+(`Qwen/Qwen3.5-4B`) than the Mac MLX path — this is deliberate, not a
+mismatch to fix. Two things about it are easy to get wrong:
+
+- **It needs `HF_CHAT_MODEL`'s `transformers` support.** `Qwen3.5-4B`'s
+  `model_type` (`qwen3_5`) may not exist yet in a stable `transformers`
+  release — its own model card says to install from `main`:
+  `pip install "transformers[serving] @ git+https://github.com/huggingface/transformers.git@main"`
+  (also needs `torchvision` + `pillow`, even for text-only use — already in
+  `requirements.txt`). If the installed version doesn't recognize it,
+  `backend/chat.py` raises a clear error naming this exact fix rather than a
+  bare `Unrecognized configuration class` traceback.
+- **It's a vision-language checkpoint, but that's not a problem in itself.**
+  Its `config.json` lists `architectures: ["Qwen3_5ForConditionalGeneration"]`
+  (the VLM class) plus a full vision tower — but that field is metadata, not
+  what actually loads: `transformers`' `AutoModelForCausalLM` resolves
+  `qwen3_5` to `Qwen3_5ForCausalLM`, a dedicated text-only class that never
+  instantiates the vision tower (`chat.py` already uses `AutoModelForCausalLM`,
+  correctly). What genuinely costs time is that **Qwen3.5 thinks by default**
+  — it emits a `<think>...</think>` block (recommended up to 32k–80k tokens
+  for hard tasks per its model card) before every reply unless
+  `enable_thinking=False` is honored by the chat template. `chat.py` passes
+  that already; if it ever silently stops working, every reply pays for a
+  full hidden reasoning pass with nothing visibly wrong client-side — exactly
+  "got slower, no error." `chat.py` now decodes the raw output once per
+  response to detect this and logs `[chat] enable_thinking=False did NOT
+  suppress a <think> block ...` if it happens.
+
+Check what's actually loaded — model, device, quantization — with
+`GET /api/chat-status`, and watch the backend log for that `<think>`-leak
+warning after a real chat message.
 
 ### 1. Get the models onto the server
 - ASR: `models/whisper-large-v3-persian-ct2-int8/` (CTranslate2 int8 Whisper large-v3
   fine-tuned for Persian) — copy this directory from the repo root, or re-download
   via `huggingface-cli download` if you have the original model id.
-- Chat: `Qwen/Qwen3-4B-Instruct-2507` is fetched automatically from Hugging Face
-  the first time `backend/chat.py` runs (no manual step, just needs the HF cache
-  to have internet access once). If overriding via `HF_CHAT_MODEL`, make sure
-  it's a plain causal-LM checkpoint -- `AutoModelForCausalLM` is what loads it,
-  so pointing this at a multimodal/VLM repo (mismatched `architectures` in its
-  `config.json`) either fails to load or loads a materially heavier model than
-  intended. Check what's actually loaded with `GET /api/chat-status`.
+- Chat: `Qwen/Qwen3.5-4B` is fetched automatically from Hugging Face the first
+  time `backend/chat.py` runs (no manual step, just needs the HF cache to have
+  internet access once, and a `transformers` install that recognizes it — see
+  above).
 
 ### 2. Install dependencies
 ```powershell
@@ -369,7 +398,7 @@ backend/
 ├── server.py         # FastAPI app, /api/* routes
 ├── pipeline.py        # VAD chunking → ASR → diarization → speaker assignment
 ├── asr_engine.py      # Whisper backend selection (MLX / CTranslate2)
-├── chat.py            # Qwen3-4B backend selection (MLX / transformers)
+├── chat.py            # Qwen3 chat backend selection (MLX / transformers)
 └── correct.py         # optional per-segment GPT cleanup pass
 ```
 

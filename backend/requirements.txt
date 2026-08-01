@@ -31,7 +31,18 @@ mlx-lm               # runs Qwen3-4B-Instruct-2507-4bit on the GPU
 # NVIDIA GPU is present, else CPU):
 # torch + transformers below also cover this -- accelerate speeds up GPU loading
 accelerate
-transformers>=4.37   # required for the Qwen2 tokenizer (do NOT let NeMo pin it to 4.33)
+# Windows/Linux run Qwen/Qwen3.5-4B (see backend/chat.py), whose "qwen3_5"
+# model_type may not exist yet in a stable transformers release -- its own
+# model card says to install from `main`. `>=4.37` is NOT sufficient for it;
+# that floor is only what the Qwen2 tokenizer needs. If pip resolves a
+# transformers that doesn't recognize qwen3_5, chat.py's _ensure() raises a
+# clear, actionable error rather than a bare "Unrecognized configuration
+# class" -- but the real fix, if that fires, is:
+#   pip install "transformers[serving] @ git+https://github.com/huggingface/transformers.git@main"
+# (do NOT let NeMo pin transformers back down to 4.33)
+transformers>=4.37
+torchvision          # Qwen3.5 is a vision-language checkpoint; its model card
+pillow               # requires both even for text-only use
 
 # On Windows/Linux with an NVIDIA GPU, install a CUDA build of torch BEFORE the
 # rest of this file, e.g.:
