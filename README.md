@@ -112,6 +112,9 @@ The frontend proxies `/api/*` to the backend (see `vite.config.ts`).
 | `POST` | `/api/chat` | `{ messages, transcript }` → streamed Persian reply (local Qwen3-4B) |
 | `POST` | `/api/chat/title` | `{ transcript }` → `{ title }` |
 | `GET` | `/api/health` | model presence check (`gpt_correct_available` reflects whether `OPENAI_API_KEY` is set) |
+| `GET` | `/api/asr-status` | loads the ASR backend now, reports actual device/compute_type (e.g. confirms CUDA isn't silently falling back to CPU) |
+| `GET` | `/api/chat-status` | loads the chat LLM now, reports actual model/device/quantization -- "which language model is loaded" answered directly |
+| `GET` | `/api/diarizer-status` | loads pyannote now, reports which pipeline (community-1 / 3.1) and whether exclusive diarization is active |
 
 The ASR (Whisper) and chat (Qwen3-4B) models run entirely locally — on MLX/Metal
 on a Mac, or CTranslate2/`transformers` on CUDA/CPU elsewhere — nothing is sent
@@ -137,7 +140,11 @@ same API, same pipeline, no code changes needed:
   via `huggingface-cli download` if you have the original model id.
 - Chat: `Qwen/Qwen3-4B-Instruct-2507` is fetched automatically from Hugging Face
   the first time `backend/chat.py` runs (no manual step, just needs the HF cache
-  to have internet access once).
+  to have internet access once). If overriding via `HF_CHAT_MODEL`, make sure
+  it's a plain causal-LM checkpoint -- `AutoModelForCausalLM` is what loads it,
+  so pointing this at a multimodal/VLM repo (mismatched `architectures` in its
+  `config.json`) either fails to load or loads a materially heavier model than
+  intended. Check what's actually loaded with `GET /api/chat-status`.
 
 ### 2. Install dependencies
 ```powershell

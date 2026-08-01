@@ -122,6 +122,16 @@ def asr_status():
     return pipeline.asr_diagnostic()
 
 
+@app.get("/api/chat-status")
+def chat_status():
+    """Diagnostic: loads the chat LLM right now (same code path used by the AI
+    Analysis panel) and reports the actual model/device/quantization in use --
+    answers "which language model is loaded" and "is it on GPU" without
+    SSH+profiling. See chat.backend_info()."""
+    chat._ensure()
+    return {"backend": chat._active, **chat.backend_info()}
+
+
 @app.get("/api/diarizer-status")
 def diarizer_status():
     """Diagnostic: attempts to load pyannote 3.1 right now (same code path

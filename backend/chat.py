@@ -22,13 +22,24 @@ import sys
 import threading
 
 MLX_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-HF_MODEL = os.environ.get("HF_CHAT_MODEL", "Qwen/Qwen3.5-4B")
+# NOT "Qwen/Qwen3.5-4B" -- that is a DIFFERENT, newer model: a
+# vision-language model (architectures: ["Qwen3_5ForConditionalGeneration"],
+# a full ViT vision tower, image/video token ids in its config.json), loaded
+# here with AutoModelForCausalLM, the wrong model class for it. It is also a
+# hybrid linear-attention architecture, materially heavier per token than the
+# plain Qwen3-4B-Instruct-2507 the MLX backend (and the README) actually
+# promise. Whatever HF_MODEL resolves to, it should be the SAME model as
+# MLX_MODEL above -- Windows and Mac are supposed to run identical model
+# behavior on different runtimes, not different models.
+HF_MODEL = os.environ.get("HF_CHAT_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 _SNAP_GLOB = "models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/*/chat_template.jinja"
 
 _active = None  # "mlx" | "transformers"
 _MODEL = None
 _TOK = None
 _TMPL = None
+# Diagnostic snapshot of what _ensure() actually loaded -- see backend_info().
+_device_info: dict = {}
 
 
 def _try_mlx() -> bool:
@@ -67,6 +78,7 @@ def _ensure():
         _MODEL, _TOK = load(MLX_MODEL)
         hits = glob.glob(os.path.join(os.path.expanduser("~/.cache/huggingface/hub"), _SNAP_GLOB))
         _TMPL = open(hits[0]).read() if hits else None
+        _device_info.update(backend="mlx", model=MLX_MODEL, device="metal", quantization="4bit")
     else:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -104,13 +116,26 @@ def _ensure():
         if quant_cfg is not None:
             _MODEL = AutoModelForCausalLM.from_pretrained(
                 HF_MODEL, quantization_config=quant_cfg, device_map={"": 0})
-            print("[chat] loaded in 8-bit on cuda", file=sys.stderr, flush=True)
+            print(f"[chat] {HF_MODEL} loaded in 8-bit on cuda", file=sys.stderr, flush=True)
+            _device_info.update(backend="transformers", model=HF_MODEL, device="cuda",
+                                quantization="8bit")
         else:
             _MODEL = AutoModelForCausalLM.from_pretrained(
                 HF_MODEL, torch_dtype=dtype).to(device)
-            print(f"[chat] loaded in {dtype} on {device}", file=sys.stderr, flush=True)
+            print(f"[chat] {HF_MODEL} loaded in {dtype} on {device}", file=sys.stderr, flush=True)
+            _device_info.update(backend="transformers", model=HF_MODEL, device=device,
+                                quantization=None)
         _MODEL.eval()
     return _MODEL, _TOK, _TMPL
+
+
+def backend_info() -> dict:
+    """Diagnostic snapshot of which chat model/device/quantization actually
+    got loaded -- call _ensure() (or send one chat message) first if this
+    returns {"loaded": False}; deliberately does not force a load itself."""
+    if _MODEL is None:
+        return {"loaded": False}
+    return {"loaded": True, **_device_info}
 
 
 def unload() -> bool:
@@ -128,6 +153,7 @@ def unload() -> bool:
     if _MODEL is None:
         return False
     _MODEL = _TOK = _TMPL = None
+    _device_info.clear()
     try:
         import gc
         gc.collect()
