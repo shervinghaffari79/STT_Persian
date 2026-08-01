@@ -394,6 +394,29 @@ Worth setting on the server, as the OOM message itself suggests:
 $env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ```
 
+### Stateless chat turns
+
+Each question is answered **independently**: only the newest user turn is sent,
+never the conversation so far. The transcript is re-embedded in the system
+prompt on every request, so history is pure additive growth on top of an
+already-large constant — left unbounded, a handful of follow-ups on a long
+recording walks the prompt into the KV-cache headroom left after Whisper and
+the chat weights. That is why the earlier OOM appeared on the *second* message
+rather than the first.
+
+| turn | with history | stateless |
+|---|---|---|
+| 1 | 5,400 tok · 0.18 GB | 5,200 tok · 0.17 GB |
+| 10 | 9,000 tok · 0.29 GB | 5,200 tok · 0.17 GB |
+| 40 | 21,000 tok · 0.69 GB | 5,200 tok · 0.17 GB |
+
+**The cost is real:** the model cannot resolve a follow-up that refers back —
+"توضیح بیشتر بده", "why?", "and the second one?" — because it never sees what
+came before. Every question has to stand on its own. The full transcript is
+still available to it, so questions *about the recording* work exactly as
+before; only references to earlier chat turns break. `CHAT_STATELESS=0`
+restores the full conversation.
+
 ### Chat model knobs
 
 The chat LLM runs **unquantized** (fp16 on CUDA). 8-bit was previously the
@@ -413,6 +436,7 @@ fp16 tensor-core support.
 | `CHAT_8BIT` | `0` (off) | fp16 (faster). `1` = 8-bit, ~8 GB → ~5 GB, slower — use if long transcripts exhaust the ~2.75 GB headroom |
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
 | `JOB_STALL_TIMEOUT` | `1800` | Seconds without progress before a job is failed so the UI stops waiting |
+| `CHAT_STATELESS` | `1` (on) | Each question answered independently — prior turns are not sent. `0` keeps the full conversation |
 | `CHAT_BACKEND` | `auto` | `mlx` \| `transformers` if auto-detection guesses wrong |
 | `HF_CHAT_MODEL` | `Qwen/Qwen3.5-4B` | Override the Windows/Linux chat model |
 

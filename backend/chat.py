@@ -55,6 +55,12 @@ HF_MODEL = os.environ.get("HF_CHAT_MODEL", "Qwen/Qwen3.5-4B")
 # actionable message instead of a bare "Unrecognized configuration class"
 # traceback from deep inside from_pretrained().
 _REQUIRED_MODEL_TYPE = "qwen3_5"
+
+# Treat every question as independent: send only the newest user turn, never
+# the conversation so far. Keeps the prompt -- and therefore the KV cache --
+# the same size on turn 20 as on turn 1. See _build_messages(). 0 = keep the
+# full conversation, at the cost of a prompt that grows with every exchange.
+CHAT_STATELESS = os.environ.get("CHAT_STATELESS", "1") != "0"
 _SNAP_GLOB = "models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/*/chat_template.jinja"
 
 _active = None  # "mlx" | "transformers"
@@ -260,9 +266,31 @@ def _system_prompt(transcript: str) -> str:
 
 def _build_messages(messages, transcript):
     msgs = [{"role": "system", "content": _system_prompt(transcript)}]
-    for m in messages:
-        if m.get("role") in ("user", "assistant") and m.get("content"):
-            msgs.append({"role": m["role"], "content": m["content"]})
+    history = [m for m in messages
+               if m.get("role") in ("user", "assistant") and m.get("content")]
+
+    if CHAT_STATELESS:
+        # Answer each question on its own: keep only the newest user turn and
+        # drop every earlier question and answer.
+        #
+        # The transcript is re-embedded in the system prompt on EVERY request
+        # (see _system_prompt), so conversation history is pure additive growth
+        # on top of an already-large constant. Left unbounded, a handful of
+        # follow-ups on a long recording walks the prompt straight into the KV
+        # cache headroom that is left after Whisper and the chat weights -- the
+        # OOM that showed up on the SECOND message rather than the first.
+        # Dropping history makes the prompt the same size on turn 20 as on turn
+        # 1, so a session cannot grow its way into an OOM.
+        #
+        # The cost is real and worth stating: the model cannot resolve a
+        # follow-up that refers back ("توضیح بیشتر بده", "why?"), because it
+        # never sees what came before. Each question has to stand alone.
+        # CHAT_STATELESS=0 restores the full conversation.
+        last_user = next((m for m in reversed(history) if m["role"] == "user"), None)
+        history = [last_user] if last_user else []
+
+    for m in history:
+        msgs.append({"role": m["role"], "content": m["content"]})
     return msgs
 
 
