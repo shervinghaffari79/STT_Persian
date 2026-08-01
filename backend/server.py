@@ -142,21 +142,46 @@ def _warmup():
     t0 = time.time()
     try:
         import numpy as np
-        print("[warmup] loading ASR + VAD + diarization models…", flush=True)
-        try:
-            print(f"[warmup] ASR backend: {pipeline.asr_diagnostic()}", flush=True)
-        except Exception as e:
-            print(f"[warmup] ASR load failed: {type(e).__name__}: {e}", flush=True)
+        print("[warmup] loading VAD + diarization + ASR models…", flush=True)
+
+        # Order matters, and it is deliberately the pipeline's OWN order of use
+        # (VAD -> diarize -> ASR), not the reverse. A job submitted while warmup
+        # is still running walks that same sequence; loading ASR first -- as
+        # this used to -- means warmup is still busy with diarization exactly
+        # when a concurrent job reaches its diarization step.
         try:
             # 0.5s of silence is enough to force silero + onnxruntime to load
             pipeline._vad_segments(np.zeros(pipeline.SAMPLE_RATE // 2, dtype=np.float32))
         except Exception as e:
             print(f"[warmup] VAD load failed: {type(e).__name__}: {e}", flush=True)
+
         if pipeline.DIARIZER == "pyannote":
             try:
-                pipeline._load_pyannote()
+                if pipeline._load_pyannote() is None:
+                    print("[warmup] WARNING: diarization is NOT available -- "
+                          "transcripts will have a single speaker. See the "
+                          "[diarize] lines above for the reason.", flush=True)
             except Exception as e:
                 print(f"[warmup] pyannote load failed: {type(e).__name__}: {e}", flush=True)
+
+        # resemblyzer is the documented fallback when pyannote is unavailable.
+        # If it is missing too there is no fallback at all, and that only
+        # surfaces today at the moment a real job needs it -- by which point
+        # the transcript is already being produced with one speaker. Probe it
+        # at boot so the gap is known before it costs anyone a run.
+        try:
+            import resemblyzer  # noqa: F401 -- availability probe only
+        except Exception:
+            print("[warmup] NOTE: resemblyzer is not installed, so there is no "
+                  "diarization fallback. If pyannote is unavailable for any "
+                  "reason, transcripts get a single speaker instead of degraded "
+                  "speaker separation. Fix: pip install resemblyzer", flush=True)
+
+        try:
+            print(f"[warmup] ASR backend: {pipeline.asr_diagnostic()}", flush=True)
+        except Exception as e:
+            print(f"[warmup] ASR load failed: {type(e).__name__}: {e}", flush=True)
+
         print(f"[warmup] done in {time.time() - t0:.1f}s", flush=True)
     except Exception as e:
         print(f"[warmup] aborted: {type(e).__name__}: {e}", flush=True)

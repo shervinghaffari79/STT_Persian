@@ -979,6 +979,24 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
             turns = _TurnIndex(turns)
         print(f"[diarize] this run used: {diarizer_used} "
              f"({len(turns) if turns else 0} turns)", file=sys.stderr, flush=True)
+        if diarizer_used == "none":
+            # Diarization was ASKED FOR and produced nothing. The transcript
+            # will still be generated, so nothing errors and the UI looks
+            # normal -- it just silently labels every segment S1. That is easy
+            # to mistake for "the diarizer is bad" rather than "the diarizer
+            # never ran", so make the distinction impossible to miss in a log
+            # that is otherwise full of third-party warnings.
+            print("[diarize] " + "=" * 62 + "\n"
+                 "[diarize] NO SPEAKER SEPARATION for this run. Every segment\n"
+                 "[diarize] will be labelled S1. This is NOT a diarization\n"
+                 "[diarize] quality problem -- no diarizer ran at all.\n"
+                 "[diarize] Causes, in order of likelihood:\n"
+                 "[diarize]   * pyannote gated: accept the model's terms on HF\n"
+                 "[diarize]     with the same account as your cached token\n"
+                 "[diarize]   * no fallback installed: pip install resemblyzer\n"
+                 "[diarize]   * a load error -- see the [diarize] lines above\n"
+                 "[diarize] Check GET /api/diarizer-status for the live answer.\n"
+                 "[diarize] " + "=" * 62, file=sys.stderr, flush=True)
         # Diarization is done with the GPU from here on -- the ASR loop below is
         # the only consumer left. Release what it was holding before Whisper
         # starts allocating, otherwise the two peaks overlap for no reason.
@@ -1099,7 +1117,7 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
     segments.sort(key=lambda s: s["start"])
     speakers = sorted({s["speaker"] for s in segments}, key=lambda x: int(x[1:]))
     raw_text = "\n\n".join(f"[{s['speaker']}]: {s['text']}" for s in segments)
-    return {
+    out = {
         "duration": round(duration, 2),
         "language": "fa",
         "segments": segments,
@@ -1108,3 +1126,15 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
         "processingTime": round(time.time() - t0, 1),
         "diarizer": diarizer_used,
     }
+    # Carry the "no diarizer ran" condition out through the API too, not just
+    # the log. A transcript where every line is S1 is indistinguishable from a
+    # badly-diarized one unless something says which happened, and nobody
+    # reads the backend console before reporting "diarization is broken".
+    if diarize and DIARIZER != "off" and diarizer_used == "none":
+        out["diarizationWarning"] = (
+            "No diarizer ran, so every segment is labelled S1. This is not a "
+            "diarization-quality issue. Check GET /api/diarizer-status: most "
+            "often pyannote is gated (accept the model terms on Hugging Face "
+            "with the same account as your cached token), and the resemblyzer "
+            "fallback is not installed.")
+    return out
