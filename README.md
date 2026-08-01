@@ -417,6 +417,29 @@ still available to it, so questions *about the recording* work exactly as
 before; only references to earlier chat turns break. `CHAT_STATELESS=0`
 restores the full conversation.
 
+### Short answers, intact citations
+
+The system prompt asks for **at most 3 short sentences** (or 4 bullets for a
+genuine list) with no preamble, no restatement of the question and no closing
+summary — explicitly including "summarize"/"what was discussed", which are the
+prompts that otherwise produce a page of text. `CHAT_MAX_TOKENS` (default 350)
+is the hard backstop for when the model ignores that.
+
+Clickable references are unaffected. `Markdown.tsx` matches
+`[S1 04:12]`-style citations with a regex that **requires the closing bracket**,
+so a reply truncated at the ceiling mid-bracket would both lose the link and
+print the raw fragment (`[S1 04:`) into the answer. Two things prevent that:
+
+- the prompt tells the model to always finish a bracket it starts and to place
+  citations mid-sentence rather than as the last thing it writes;
+- `_guard_partial_citations()` withholds text from the last unclosed `[` and
+  releases it the moment `]` arrives. Anything still unclosed when the stream
+  ends is dropped, since it never became a usable citation.
+
+Only a ~14-character tail is ever held, and a `[` that clearly isn't a citation
+(`[نامفهوم]`, long bracketed text) is released immediately, so streaming feels
+unchanged. Complete citations pass through byte-for-byte.
+
 ### Chat model knobs
 
 The chat LLM runs **unquantized** (fp16 on CUDA). 8-bit was previously the
@@ -437,6 +460,7 @@ fp16 tensor-core support.
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
 | `JOB_STALL_TIMEOUT` | `1800` | Seconds without progress before a job is failed so the UI stops waiting |
 | `CHAT_STATELESS` | `1` (on) | Each question answered independently — prior turns are not sent. `0` keeps the full conversation |
+| `CHAT_MAX_TOKENS` | `350` | Hard ceiling on a reply. Backstop for the brevity instruction; raise it if answers are cut mid-sentence |
 | `CHAT_BACKEND` | `auto` | `mlx` \| `transformers` if auto-detection guesses wrong |
 | `HF_CHAT_MODEL` | `Qwen/Qwen3.5-4B` | Override the Windows/Linux chat model |
 

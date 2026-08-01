@@ -61,6 +61,14 @@ _REQUIRED_MODEL_TYPE = "qwen3_5"
 # the same size on turn 20 as on turn 1. See _build_messages(). 0 = keep the
 # full conversation, at the cost of a prompt that grows with every exchange.
 CHAT_STATELESS = os.environ.get("CHAT_STATELESS", "1") != "0"
+
+# Hard ceiling on a reply. The system prompt already asks for at most ~3
+# sentences; this is the backstop for when the model ignores that, which is
+# what turns one question into a minute of streaming and a KV cache that keeps
+# growing while it does. 350 is comfortably above a compliant answer WITH
+# citations, so it should almost never be the thing that ends generation --
+# if replies are being cut mid-sentence, raise it rather than fighting it.
+CHAT_MAX_TOKENS = int(os.environ.get("CHAT_MAX_TOKENS", "350"))
 _SNAP_GLOB = "models--mlx-community--Qwen3-4B-Instruct-2507-4bit/snapshots/*/chat_template.jinja"
 
 _active = None  # "mlx" | "transformers"
@@ -251,17 +259,26 @@ def _system_prompt(transcript: str) -> str:
             "TRANSCRIPT:\n" + transcript +
             "\n\nGuidelines:\n"
             "- Always respond in Persian (Farsi) regardless of the question's language\n"
-            "- Keep answers brief and to the point\n"
+            "- BE SHORT. Answer in at most 3 short sentences, or at most 4 bullets if "
+            "the question genuinely asks for a list. Never write an introduction, never "
+            "restate the question, never add a closing summary, and never explain your "
+            "reasoning -- give the answer directly and stop. This applies to EVERY kind "
+            "of question, including 'summarize' and 'what was discussed': answer those "
+            "in the same few sentences, not with a long report\n"
             "- Reference specific speakers (S1, S2, S3, …) when relevant\n"
             "- When you state something the transcript says, cite EXACTLY where by copying "
             "that line's full bracket verbatim, e.g. [S1 04:12] -- copy it exactly as it "
             "appears in the transcript above, speaker letter included; do not estimate, "
             "reformat, or drop the speaker. This lets the user jump to and "
             "verify that moment, so include one whenever you reference a specific claim, "
-            "decision, or quote -- not for general summaries with no single source line"
+            "decision, or quote -- not for general summaries with no single source line\n"
+            "- Always finish a citation you start: write the whole [S1 04:12] bracket "
+            "including the closing ], and place it mid-sentence rather than as the very "
+            "last thing you write. Brevity never justifies dropping or shortening one"
         )
     return ("You are a helpful AI assistant specialized in speech transcription and audio "
-            "analysis. Always respond in Persian (Farsi) briefly and to the point.")
+            "analysis. Always respond in Persian (Farsi). Be short: at most 3 short "
+            "sentences, no preamble, no closing summary -- answer directly and stop.")
 
 
 def _build_messages(messages, transcript):
@@ -391,8 +408,48 @@ def _check_thinking_leak(tok, output_ids, prompt_len):
          "'Instruct (or Non-Thinking) Mode'.", file=sys.stderr, flush=True)
 
 
-def stream_chat(messages, transcript="", max_tokens=1024, temperature=0.7):
-    """Yield generated Persian text token-by-token, on whichever backend is active."""
+def _guard_partial_citations(tokens):
+    """Withhold a trailing, still-incomplete "[..." so a cut-off reply cannot
+    emit half a citation.
+
+    Markdown.tsx matches citations with a regex that requires the closing
+    bracket -- /\\[(?:S\\d+\\s+)?(?:\\d{1,2}:)?\\d{1,2}:\\d{2}\\]/ -- so a reply
+    truncated at the token ceiling mid-bracket would not just lose one link, it
+    would print the raw fragment ("[S1 04:") into the answer. This holds back
+    the text from the last unclosed "[" and releases it as soon as the "]"
+    arrives; anything still unclosed when the stream ends is dropped, since by
+    definition it never became a usable citation.
+
+    Only a short tail is ever held (a citation is ~10 characters), so normal
+    streaming is unaffected -- a "[" that is clearly not a citation is released
+    immediately rather than stalling the output."""
+    MAX_HELD = 14
+    held = ""
+    for tok in tokens:
+        held += tok
+        cut = held.rfind("[")
+        if cut == -1 or "]" in held[cut:] or len(held) - cut > MAX_HELD:
+            # nothing open, it closed, or it is too long to be a citation
+            yield held
+            held = ""
+        elif cut > 0:
+            yield held[:cut]          # release everything before the open bracket
+            held = held[cut:]
+    if held and "]" in held:
+        yield held                     # complete after all
+
+
+def stream_chat(messages, transcript="", max_tokens=None, temperature=0.7):
+    """Yield generated Persian text token-by-token, on whichever backend is
+    active, withholding any trailing incomplete citation."""
+    yield from _guard_partial_citations(
+        _stream_tokens(messages, transcript, max_tokens, temperature))
+
+
+def _stream_tokens(messages, transcript="", max_tokens=None, temperature=0.7):
+    """Raw token stream from the active backend."""
+    if max_tokens is None:
+        max_tokens = CHAT_MAX_TOKENS
     model, tok, tmpl = _ensure()
 
     if _active == "mlx":
