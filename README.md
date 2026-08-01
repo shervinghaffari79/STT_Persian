@@ -112,6 +112,7 @@ The frontend proxies `/api/*` to the backend (see `vite.config.ts`).
 | `POST` | `/api/chat` | `{ messages, transcript }` → streamed Persian reply (local Qwen3 chat model) |
 | `POST` | `/api/chat/title` | `{ transcript }` → `{ title }` |
 | `GET` | `/api/health` | model presence check (`gpt_correct_available` reflects whether `OPENAI_API_KEY` is set) |
+| `GET` | `/api/status/{job_id}` (`?since=N`) | pass `since` = segments already held; only newer ones come back, with `partial_total`. Omit for the full snapshot |
 | `GET` | `/api/asr-status` | loads the ASR backend now, reports actual device/compute_type (e.g. confirms CUDA isn't silently falling back to CPU) |
 | `GET` | `/api/chat-status` | loads the chat LLM now, reports actual model/device/quantization -- "which language model is loaded" answered directly |
 | `GET` | `/api/diarizer-status` | loads pyannote now, reports which pipeline (community-1 / 3.1) and whether exclusive diarization is active |
@@ -269,6 +270,25 @@ across two speaker labels.
 If speakers are still being merged, set `PYANNOTE_NUM_SPEAKERS` when you know
 the headcount — it tells clustering the answer instead of asking it to infer
 one, and outperforms any threshold tuning.
+
+### Startup warmup
+
+Every heavy dependency (torch, onnxruntime/silero, speechbrain/pyannote,
+ctranslate2) is imported lazily inside the pipeline, so without warmup the
+**first** transcription after a restart pays all of it while the user watches
+a spinner — on Windows that also means hundreds of DLLs being scanned by
+Defender on first touch, and native module init holding the GIL in long
+stretches that starve uvicorn's event loop. The backend now loads them on a
+background thread at startup (`[warmup] …` lines in the log). Set `WARMUP=0`
+to skip it and keep the GPU free until a job actually arrives.
+
+> If uploads appear to hang and then "suddenly work", check the `[upload]`
+> log line for the size and duration. The upload is now streamed to disk in
+> 1 MB chunks on a worker thread; previously the whole file was read into RAM
+> and written synchronously inside the async handler, which stalled the event
+> loop for the entire write — measured at **903 ms of total starvation per
+> 0.9 s of write**, scaling with file size, during which *no* request was
+> served, including the status polls the UI depends on.
 
 ### Measuring quality (don't eyeball it)
 

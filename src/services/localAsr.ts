@@ -48,21 +48,34 @@ export async function transcribeLocal(
   onProgress?.('Uploading to local model…', 3);
   const jobId = await submit(file, opts.diarize ?? true);
 
-  let lastCount = 0;
+  // Segments accumulate here rather than being re-sent whole on every poll:
+  // the backend returns only what is newer than `since` (see /api/status), so
+  // a long transcript stops costing a full re-serialize + re-parse of every
+  // segment and its per-word timings once a second. Callers still receive the
+  // complete array, so nothing downstream of this function changes.
+  let acc: TranscriptSegment[] = [];
   const maxAttempts = 2400; // ~2h ceiling for very long audio
   for (let i = 0; i < maxAttempts; i++) {
     await sleep(1200);
-    const resp = await fetch(`${API}/status/${jobId}`);
+    const resp = await fetch(`${API}/status/${jobId}?since=${acc.length}`);
     if (!resp.ok) throw new Error(`Status check failed (${resp.status})`);
     const data = await resp.json();
 
     onProgress?.(data.message || 'Processing…', typeof data.progress === 'number' ? data.progress : 50);
 
     // stream newly-produced segments to the UI as they arrive
-    const partial = (data.partial || []) as TranscriptSegment[];
-    if (onPartial && partial.length !== lastCount) {
-      lastCount = partial.length;
-      onPartial(partial, (data.speakers || []) as string[]);
+    const fresh = (data.partial || []) as TranscriptSegment[];
+    if (fresh.length) {
+      // partial_total is the backend's authoritative count. If it disagrees
+      // with what we hold after appending, our view has drifted (a restarted
+      // job reusing the id, an older backend ignoring `since`) -- trust the
+      // backend and take its payload as the whole truth instead of appending
+      // onto a bad prefix.
+      const total = data.partial_total;
+      acc = typeof total === 'number' && total !== acc.length + fresh.length
+        ? fresh
+        : acc.concat(fresh);
+      onPartial?.(acc, (data.speakers || []) as string[]);
     }
 
     if (data.state === 'done') return data.result as LocalTranscript;
