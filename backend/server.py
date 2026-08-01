@@ -254,6 +254,22 @@ def health():
             "gpt_correct_available": bool(os.environ.get("OPENAI_API_KEY"))}
 
 
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    """Last resort: print the traceback for ANY unhandled exception.
+
+    Without this, an exception escaping a handler is turned into a bare 500 by
+    the framework and the reason can be lost -- which is how a chat failure
+    ended up reported as "Local chat backend error 500" with nothing actionable
+    anywhere. The path and exception type are now always on the console, and
+    the client gets the type/message rather than an empty 500."""
+    traceback.print_exc()
+    detail = f"{type(exc).__name__}: {exc}"
+    print(f"[error] unhandled exception on {request.method} {request.url.path} -- {detail}",
+          flush=True)
+    return JSONResponse({"error": detail, "path": request.url.path}, status_code=500)
+
+
 @app.get("/api/gpu-status")
 def gpu_status():
     """What is actually resident on the GPU right now.
@@ -313,14 +329,30 @@ def diarizer_status():
 
 @app.post("/api/chat")
 async def chat_stream(req: Request):
-    """Stream a Persian analysis reply from the local chat model."""
-    body = await req.json()
-    messages = body.get("messages", [])
-    transcript = body.get("transcript", "") or ""
+    """Stream a Persian analysis reply from the local chat model.
 
-    # off the event loop: model teardown is blocking, and doing it on the loop
-    # thread stalls every other request the way the upload handler used to
-    await run_in_threadpool(_free_gpu_for_chat)
+    Everything before the streaming generator is wrapped, because anything
+    raising here produces a bare HTTP 500 whose cause is visible only in the
+    server console -- and the client then shows "Local chat backend error 500"
+    with no way to tell a GPU problem from a request-parsing one. The failure
+    is streamed back as text instead, with the traceback logged, so the reason
+    reaches whoever is actually looking at the screen."""
+    try:
+        body = await req.json()
+        messages = body.get("messages", [])
+        transcript = body.get("transcript", "") or ""
+
+        # off the event loop: model teardown is blocking, and doing it on the
+        # loop thread stalls every other request the way the upload handler did
+        await run_in_threadpool(_free_gpu_for_chat)
+    except Exception as e:
+        traceback.print_exc()
+        detail = f"{type(e).__name__}: {e}"
+        print(f"[chat] request setup failed -- {detail}", flush=True)
+        return StreamingResponse(
+            iter([f"[chat error: the backend failed before generation started -- "
+                  f"{detail}. The full traceback is in the backend console.]"]),
+            media_type="text/plain; charset=utf-8")
 
     def gen():
         # Record the failure and handle it AFTER the except block, never
@@ -346,14 +378,20 @@ async def chat_stream(req: Request):
             # Leave the card clean: a failed generation otherwise keeps the
             # chat model resident, so the NEXT request -- including a
             # transcription -- starts against a nearly full GPU and fails too.
-            chat.unload()
-            print(f"[mem] chat OOM -- unloaded chat model. {pipeline.gpu_report()}",
-                  flush=True)
+            # Guarded: this is recovery, and recovery raising would replace a
+            # readable error with a broken stream.
+            try:
+                chat.unload()
+                print(f"[mem] chat OOM -- unloaded chat model. {pipeline.gpu_report()}",
+                      flush=True)
+            except Exception:
+                traceback.print_exc()
             yield ("\n[chat error: GPU out of memory. The transcription models "
                    "were freed first, so this is the chat model alone not "
                    "fitting. It has been unloaded, so the next request should "
                    "work. See /api/gpu-status.]")
         else:
+            print(f"[chat] generation failed -- {msg}", flush=True)
             yield f"\n[chat error: {msg}]"
 
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
