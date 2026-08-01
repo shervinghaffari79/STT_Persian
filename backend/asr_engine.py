@@ -156,11 +156,15 @@ def unload() -> bool:
     cross-thread teardown. _ensure_loaded() calls load_model() to bring it back
     before the next transcription.
 
-    Still opt-in, because the crash above cost real debugging time and freeing
-    pyannote alone already resolves the OOM this exists for: ~1.4 GiB free
-    afterwards versus the 0.25 GiB allocation that was failing."""
+    On by default: freeing pyannote alone was NOT enough in practice. Measured
+    at a real chat OOM, Whisper still held 4.11 GiB while only 2.73 GiB was
+    free, and releasing it takes the headroom for KV cache and activations to
+    6.84 GiB -- 2.5x. Nothing needs Whisper during a chat reply: the transcript
+    it produced is already stored in the job result and in the client.
+    CHAT_FREE_WHISPER=0 disables this if the unload_model() path ever misbehaves
+    the way the destructor did."""
     global _ct2_unloaded
-    if os.environ.get("CHAT_FREE_WHISPER", "0") == "0":
+    if os.environ.get("CHAT_FREE_WHISPER", "1") == "0":
         return False
     with _SELECT_LOCK:
         if _ct2_model is None or _ct2_unloaded:

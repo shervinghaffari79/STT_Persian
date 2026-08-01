@@ -220,10 +220,16 @@ def unload() -> bool:
     _device_info.clear()
     try:
         import gc
+        # Two passes: transformers models contain reference CYCLES (modules
+        # holding hooks/configs that point back), and a single collect() only
+        # breaks the cycle -- the second reclaims what that freed. Without it
+        # the weights can survive an unload that reports success.
+        gc.collect()
         gc.collect()
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
     except Exception:
         pass
     return True

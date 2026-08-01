@@ -323,26 +323,38 @@ async def chat_stream(req: Request):
     await run_in_threadpool(_free_gpu_for_chat)
 
     def gen():
+        # Record the failure and handle it AFTER the except block, never
+        # inside it. While a handler is running, Python holds the exception as
+        # the "current exception" -- its traceback keeps stream_chat's frame
+        # alive, and that frame holds `model`. Calling chat.unload() in there
+        # clears the module global but frees nothing, which is precisely what
+        # the log showed: 7.97 GiB still allocated on the gpu_report printed
+        # immediately after "unloaded chat model". Clearing e.__traceback__ is
+        # NOT sufficient either; only leaving the handler releases it.
+        failure = None
         try:
             for tok in chat.stream_chat(messages, transcript):
                 yield tok
-        except Exception as e:  # surface errors inline so the UI can show them
+        except Exception as e:
             msg = str(e)
-            if "out of memory" in msg.lower():
-                # Leave the card clean: a failed generation otherwise keeps the
-                # partially-allocated chat model resident, so the NEXT request
-                # -- including a transcription -- starts against a nearly full
-                # GPU and fails too, which is what made this look like the whole
-                # backend wedging rather than one request failing.
-                chat.unload()
-                print(f"[mem] chat OOM -- unloaded chat model. {pipeline.gpu_report()}",
-                      flush=True)
-                yield ("\n[chat error: GPU out of memory. The transcription models "
-                       "were freed first, so this is the chat model alone not "
-                       "fitting. It has been unloaded, so the next request should "
-                       "work. See /api/gpu-status.]")
-            else:
-                yield f"\n[chat error: {e}]"
+            failure = ("oom" if "out of memory" in msg.lower() else "error", msg)
+
+        if failure is None:
+            return
+        kind, msg = failure
+        if kind == "oom":
+            # Leave the card clean: a failed generation otherwise keeps the
+            # chat model resident, so the NEXT request -- including a
+            # transcription -- starts against a nearly full GPU and fails too.
+            chat.unload()
+            print(f"[mem] chat OOM -- unloaded chat model. {pipeline.gpu_report()}",
+                  flush=True)
+            yield ("\n[chat error: GPU out of memory. The transcription models "
+                   "were freed first, so this is the chat model alone not "
+                   "fitting. It has been unloaded, so the next request should "
+                   "work. See /api/gpu-status.]")
+        else:
+            yield f"\n[chat error: {msg}]"
 
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
 
