@@ -318,7 +318,9 @@ async def chat_stream(req: Request):
     messages = body.get("messages", [])
     transcript = body.get("transcript", "") or ""
 
-    _free_gpu_for_chat()
+    # off the event loop: model teardown is blocking, and doing it on the loop
+    # thread stalls every other request the way the upload handler used to
+    await run_in_threadpool(_free_gpu_for_chat)
 
     def gen():
         try:
@@ -348,7 +350,7 @@ async def chat_stream(req: Request):
 @app.post("/api/chat/title")
 async def chat_title(req: Request):
     body = await req.json()
-    _free_gpu_for_chat()
+    await run_in_threadpool(_free_gpu_for_chat)
     try:
         return {"title": chat.make_title(body.get("transcript", "") or "")}
     except Exception as e:

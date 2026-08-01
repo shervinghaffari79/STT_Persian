@@ -36,6 +36,7 @@ BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
 
 _ct2_model = None
 _active = None  # "mlx" | "ctranslate2", set on first use
+_ct2_unloaded = False  # weights released via unload_model(); object still valid
 _SELECT_LOCK = threading.Lock()
 # Diagnostic snapshot of what _select() actually decided and why -- see
 # backend_info(). Populated as a side effect of _try_mlx()/_try_ctranslate2()
@@ -134,39 +135,67 @@ def active_backend() -> str:
 
 
 def unload() -> bool:
-    """Free the Whisper weights from the GPU. Returns True if anything was freed.
+    """Release Whisper's GPU memory WITHOUT destroying the model object.
+    Returns True if anything was released. Off unless CHAT_FREE_WHISPER=1.
 
-    The counterpart to chat.unload(). Transcription has always dropped the chat
-    model before starting, but nothing ever dropped Whisper before a chat
-    request, so the two peaks overlapped in one direction only -- which is what
-    puts a T4 over the line once the chat model is unquantized.
+    History, because it matters for anyone tempted to "simplify" this:
+    freeing this memory by dropping the Python reference and letting
+    CTranslate2's destructor run (`_ct2_model = None; gc.collect()`) hard-
+    crashes the worker on this project's Windows/CUDA deployment -- the process
+    exits instantly with no Python traceback, because the fault is below the
+    interpreter and no try/except can see it. That was tried twice, once with
+    ctranslate2's explicit unload_model() called first and once without; the
+    common factor in both crashes was the destruction, not unload_model().
+    CTranslate2's own docs do say `del` is fine, so this is environment-
+    specific (very likely the model being torn down on a different thread from
+    the one that built it -- CUDA state is per-thread, and this is invoked from
+    a request handler while the model was created on the warmup or job thread).
 
-    CTranslate2 allocates OUTSIDE PyTorch's caching allocator, so this memory is
-    invisible to torch.cuda.memory_allocated() and unreachable by
-    torch.cuda.empty_cache(): on the reported OOM, ~4.1 GiB of the card was held
-    here while PyTorch could only see (and only report) its own 10.4 GiB.
-    Releasing it means dropping the model object itself.
+    unload_model() is the documented way to free the device memory while
+    keeping the object alive and valid, so there is no destructor to run and no
+    cross-thread teardown. _ensure_loaded() calls load_model() to bring it back
+    before the next transcription.
 
-    The next transcribe_chunk() reloads lazily -- a few seconds -- so this only
-    trades reload time, never correctness."""
-    global _ct2_model, _active
+    Still opt-in, because the crash above cost real debugging time and freeing
+    pyannote alone already resolves the OOM this exists for: ~1.4 GiB free
+    afterwards versus the 0.25 GiB allocation that was failing."""
+    global _ct2_unloaded
+    if os.environ.get("CHAT_FREE_WHISPER", "0") == "0":
+        return False
     with _SELECT_LOCK:
-        if _ct2_model is None:
+        if _ct2_model is None or _ct2_unloaded:
             return False
-        # Drop the reference and let CTranslate2's destructor release the
-        # device memory. Deliberately NOT calling ctranslate2's explicit
-        # unload_model() first: that tears the model down and the destructor
-        # then runs over an already-torn-down object. A double teardown in a
-        # native extension is not something a Python try/except can contain --
-        # it takes the worker process with it, which from the browser looks
-        # like the request failing and the backend restarting rather than an
-        # error being handled. One teardown, via refcount, is enough.
-        _ct2_model = None
-        _active = None      # force a fresh _select() (and reload) next time
-    import gc
-    gc.collect()
-    print("[mem] unloaded Whisper (ctranslate2) from the GPU", file=sys.stderr, flush=True)
+        inner = getattr(_ct2_model, "model", None)
+        if inner is None or not hasattr(inner, "unload_model"):
+            print("[mem] this ctranslate2 build has no unload_model(); leaving "
+                  "Whisper resident (NOT dropping the object -- that crashes)",
+                  file=sys.stderr, flush=True)
+            return False
+        try:
+            inner.unload_model()          # object stays alive and reusable
+            _ct2_unloaded = True
+        except Exception as e:
+            print(f"[mem] ctranslate2 unload_model() failed ({type(e).__name__}: {e}) "
+                  "-- leaving Whisper resident", file=sys.stderr, flush=True)
+            return False
+    print("[mem] released Whisper's GPU memory (object kept for reload)",
+          file=sys.stderr, flush=True)
     return True
+
+
+def _ensure_loaded():
+    """Bring the weights back if unload() released them. Cheap no-op otherwise."""
+    global _ct2_unloaded
+    if not _ct2_unloaded:
+        return
+    with _SELECT_LOCK:
+        if not _ct2_unloaded:
+            return
+        inner = getattr(_ct2_model, "model", None)
+        if inner is not None and hasattr(inner, "load_model"):
+            inner.load_model()
+            print("[mem] reloaded Whisper onto the GPU", file=sys.stderr, flush=True)
+        _ct2_unloaded = False
 
 
 def backend_info() -> dict:
@@ -265,6 +294,7 @@ def transcribe_chunk(audio, sample_rate: int = 16000, word_timestamps: bool = Fa
     # ctranslate2 / faster-whisper -- pipeline.py already VAD-chunked the
     # audio, so vad_filter is off here to avoid re-segmenting a chunk that's
     # already speech-only.
+    _ensure_loaded()   # no-op unless a chat request released the weights
     segments, _info = _ct2_model.transcribe(
         audio, language="fa", task="transcribe", beam_size=BEAM_SIZE,
         temperature=_temperatures(), compression_ratio_threshold=2.4,

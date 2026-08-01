@@ -188,6 +188,11 @@ def free_for_chat() -> list:
     Returns the names of what was actually freed, for logging. Everything
     reloads lazily on the next transcription."""
     freed = []
+    # pyannote first: it is pure PyTorch, so releasing it is thread-safe and
+    # has no native teardown to go wrong. It is also sufficient on its own --
+    # the OOM this exists for was short by 250 MiB, and dropping pyannote frees
+    # well over a gigabyte. Whisper is left alone by default; see
+    # asr_engine.unload() for why touching it is opt-in.
     try:
         import asr_engine
         if asr_engine.unload():

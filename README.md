@@ -350,14 +350,36 @@ swaps them:
 | When | Freed | Reloads |
 |---|---|---|
 | a transcription starts | chat LLM (~9 GB) | on the next chat request |
-| a chat request starts | Whisper + pyannote | on the next transcription |
+| a chat request starts | pyannote (~1.1 GB) | on the next transcription |
 
-Both directions are needed. Only the first existed originally, which is why an
-unquantized chat model OOM'd: Whisper's CTranslate2 weights stayed resident
-through every chat reply. **CTranslate2 allocates outside PyTorch's allocator**,
-so that block never appears in a torch OOM message and `torch.cuda.empty_cache()`
-cannot reclaim it — on the reported failure it was ~4.1 GB, which is exactly why
-the numbers in that error don't add up to the card's capacity.
+Only the first direction existed originally, which is why an unquantized chat
+model OOM'd. The arithmetic on a 14.83 GB T4:
+
+```
+CT2/Whisper 4.11 + chat 9.30 + pyannote 1.10 = 14.51  → 0.32 GB free  ✗ (needed 0.25 GB, failed)
+CT2/Whisper 4.11 + chat 9.30                 = 13.41  → 1.42 GB free  ✓
+```
+
+Freeing pyannote alone is enough — that 1.42 GB also covers a ~32k-token KV
+cache. **Whisper is deliberately left resident.**
+
+> ⚠️ **Do not free Whisper by dropping the object.** `_ct2_model = None` +
+> `gc.collect()` hard-crashes the worker on this Windows/CUDA deployment: the
+> process exits instantly with *no Python traceback*, because the fault is below
+> the interpreter and no `try/except` can see it. That was tried twice — once
+> with `unload_model()` called first, once without — and the common factor in
+> both crashes was the destruction, not `unload_model()`. CTranslate2's docs do
+> say `del` is fine, so this is environment-specific (most likely the model
+> being torn down on a different thread from the one that built it; CUDA state
+> is per-thread). `CHAT_FREE_WHISPER=1` opts into releasing it via the
+> documented `unload_model()`/`load_model()` pair, which keeps the object alive
+> so there is no destructor to run — but it is off by default and unnecessary
+> given the numbers above.
+
+**CTranslate2 allocates outside PyTorch's allocator**, so its block never
+appears in a torch OOM message and `torch.cuda.empty_cache()` cannot reclaim it
+— which is why the numbers in that error don't add up to the card's capacity.
+`GET /api/gpu-status` reports it as `non_torch_gib`.
 
 If a transcription is *running* when a chat request arrives, the ASR models are
 deliberately **not** freed (that would break the job) — chat may then be short on
@@ -395,6 +417,7 @@ fp16 tensor-core support.
 
 | Env var | Default | Effect |
 |---|---|---|
+| `CHAT_FREE_WHISPER` | `0` (off) | `1` releases Whisper's VRAM during chat via `unload_model()`. Off by default — see the warning above; freeing pyannote alone already suffices |
 | `CHAT_8BIT` | `0` (off) | `1` re-enables bitsandbytes 8-bit: ~9 GB → ~5 GB VRAM, at a real cost in tokens/sec |
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
 | `CHAT_BACKEND` | `auto` | `mlx` \| `transformers` if auto-detection guesses wrong |
