@@ -341,6 +341,33 @@ check for it before trading accuracy for speed.
 | `DEDUPE_THRESHOLD` | `0.6` | Similarity above which an adjacent repeated segment is dropped |
 | `CT2_COMPUTE_TYPE` | `int8_float16` on CUDA | Override the compute type |
 
+### Chat model knobs
+
+The chat LLM runs **unquantized** (fp16 on CUDA). 8-bit was previously the
+default, which traded generation speed for VRAM without saying so: bitsandbytes
+`LLM.int8()` is a *footprint* optimization, not a speed one — it dequantizes on
+the fly plus runs a mixed-precision path for outlier channels, and only pays
+for itself above a hidden-dimension crossover. Qwen3.5-4B (hidden size 2560)
+sits below it, so 8-bit was actively slower than fp16 there; a widely-cited
+7B/A100 comparison shows ~6.7 tok/s at 8-bit vs ~16.7 tok/s at fp16.
+
+fp16 rather than bf16 on CUDA is deliberate: the checkpoint is bf16, but bf16
+needs Ampere (sm_80+) and the T4 is Turing (sm_75) — no bf16 hardware, full
+fp16 tensor-core support.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `CHAT_8BIT` | `0` (off) | `1` re-enables bitsandbytes 8-bit: ~9 GB → ~5 GB VRAM, at a real cost in tokens/sec |
+| `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
+| `CHAT_BACKEND` | `auto` | `mlx` \| `transformers` if auto-detection guesses wrong |
+| `HF_CHAT_MODEL` | `Qwen/Qwen3.5-4B` | Override the Windows/Linux chat model |
+
+The chat model is unloaded before every transcription (see `server.py`), so at
+~9 GB fp16 it only contends with ASR/diarization if a chat request arrives
+*mid-job*. If that combination OOMs on a 16 GB card, `CHAT_8BIT=1` or
+`CHAT_DEVICE=cpu` are the escape hatches. Confirm what's actually loaded with
+`GET /api/chat-status` — it reports `quantization: null` when unquantized.
+
 > **torchcodec on Windows:** pyannote.audio 4.x dropped the `soundfile`/`sox`
 > audio backends, so it decodes via torchcodec. If the log shows
 > `Could not load libtorchcodec`, torchcodec doesn't match your torch build —

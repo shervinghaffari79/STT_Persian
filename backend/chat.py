@@ -128,10 +128,15 @@ def _ensure():
                 "(also needs torchvision and pillow present, even for text-only "
                 "use -- see the model card's Transformers quickstart). Or pin "
                 "HF_CHAT_MODEL to a model your installed transformers supports.")
-        # CHAT_DEVICE forces cpu on a GPU box: the 4B fp16 weights are ~8GB, and
-        # on a 16GB card that is more than half the board held for a panel that
-        # is used on demand. CPU generation is much slower but leaves the GPU
-        # entirely to ASR/diarization.
+        # CHAT_DEVICE forces cpu on a GPU box: Qwen3.5-4B is 4.66B params, so
+        # ~9GB in fp16 -- over half a 16GB card held for a panel that is used
+        # on demand. CPU generation is much slower but leaves the GPU entirely
+        # to ASR/diarization.
+        #
+        # fp16 (not bf16) on CUDA is deliberate: the checkpoint is bf16, but
+        # bf16 needs Ampere (sm_80+) and this deploys to a T4 (Turing, sm_75),
+        # where bf16 has no hardware support while fp16 has full tensor-core
+        # support.
         want = os.environ.get("CHAT_DEVICE", "auto").lower()
         if want in ("cuda", "cpu"):
             device = want
@@ -140,16 +145,29 @@ def _ensure():
         dtype = torch.float16 if device == "cuda" else torch.float32
         _TOK = AutoTokenizer.from_pretrained(HF_MODEL)
 
-        # 8-bit weights roughly halve the footprint (~8GB fp16 -> ~4.5GB), which
-        # is what keeps this off the CUDA OOM line when Whisper and pyannote are
-        # also competing for the card. On by default on CUDA; CHAT_8BIT=0 opts
-        # back into fp16 if the accuracy or the speed matters more.
+        # Quantization is OFF by default: the model runs at full fp16 on CUDA.
+        #
+        # This used to default to bitsandbytes 8-bit, which was a memory
+        # decision that quietly cost latency. LLM.int8() is a footprint
+        # optimization, not a speed one -- it dequantizes on the fly and runs a
+        # mixed-precision decomposition for outlier channels, and it only pays
+        # for itself on large hidden dimensions. Below that crossover it is
+        # SLOWER than plain fp16, and reported figures are not subtle (a 7B on
+        # an A100: ~6.7 tok/s at 8-bit vs ~16.7 tok/s at fp16). Qwen3.5-4B's
+        # hidden size is 2560, i.e. squarely on the wrong side of that
+        # crossover, so 8-bit here was buying VRAM with generation speed.
+        #
+        # CHAT_8BIT=1 opts back in when VRAM is the binding constraint --
+        # roughly halves the footprint (~9GB fp16 -> ~5GB). Note the chat model
+        # is unloaded before every transcription (see server.py), so it only
+        # contends with ASR/diarization if a chat request arrives mid-job;
+        # CHAT_DEVICE=cpu is the other escape hatch.
         #
         # Quantized loads must NOT be followed by .to(device): bitsandbytes
         # places the weights itself through accelerate, and moving the module
         # afterwards raises. Hence the separate device_map path below.
         quant_cfg = None
-        if device == "cuda" and os.environ.get("CHAT_8BIT", "1") != "0":
+        if device == "cuda" and os.environ.get("CHAT_8BIT", "0") != "0":
             try:
                 import bitsandbytes  # noqa: F401 -- availability probe only
                 from transformers import BitsAndBytesConfig
