@@ -28,6 +28,7 @@ produced, before it is streamed to the client or included in the final result.
 import bisect
 import difflib
 import os
+import threading
 import subprocess
 import sys
 import time
@@ -128,6 +129,16 @@ _PYANNOTE = None
 _PYANNOTE_ID = None      # which pipeline id actually loaded, for reporting
 _PYANNOTE_TRIED = False
 
+# These lazy loaders are now reachable from TWO threads at once: the startup
+# warmup thread and a job thread, if a file is uploaded while warmup is still
+# running. Without a lock, the second caller sees a half-initialised global --
+# for pyannote that meant silently getting None and falling back to a much
+# weaker diarizer, with nothing in the log to say it happened. A lock makes a
+# concurrent caller WAIT for the in-flight load and then get the real model.
+_PYANNOTE_LOCK = threading.Lock()
+_VAD_LOCK = threading.Lock()
+_VAD_MODEL = None
+
 
 def _log(msg, cb=None):
     if cb:
@@ -204,11 +215,24 @@ def decode_audio(path: str) -> np.ndarray:
 
 # ── speech segmentation for transcription ──────────────────────────────────
 
+def _vad_model():
+    """Silero VAD, loaded once. Guarded because the warmup thread and a job
+    thread can reach this simultaneously."""
+    global _VAD_MODEL
+    if _VAD_MODEL is not None:
+        return _VAD_MODEL
+    with _VAD_LOCK:
+        if _VAD_MODEL is None:
+            from silero_vad import load_silero_vad
+            _VAD_MODEL = load_silero_vad()
+    return _VAD_MODEL
+
+
 def _vad_segments(audio):
-    from silero_vad import load_silero_vad, get_speech_timestamps
+    from silero_vad import get_speech_timestamps
     import torch
     return get_speech_timestamps(
-        torch.from_numpy(audio), load_silero_vad(), sampling_rate=SAMPLE_RATE,
+        torch.from_numpy(audio), _vad_model(), sampling_rate=SAMPLE_RATE,
         min_silence_duration_ms=300, min_speech_duration_ms=250, speech_pad_ms=100,
         return_seconds=False)
 
@@ -382,11 +406,46 @@ def _pyannote_overrides(pipe) -> dict:
 
 
 def _load_pyannote():
-    """Load pyannote 3.1, applying the torch-2.8 / speechbrain-1.1 compat patches."""
+    """Load the diarization pipeline, applying the torch / speechbrain compat
+    patches. Thread-safe: concurrent callers block until the first finishes and
+    then receive the same pipeline.
+
+    _PYANNOTE_TRIED is deliberately set only AFTER the attempt resolves (in the
+    finally below), never before it. It used to be set on entry, which made it
+    mean two different things -- "already failed, don't retry" and "a load is
+    in flight" -- indistinguishable to a second thread. Once the startup warmup
+    ran in its own thread, a job starting during warmup hit exactly that: it
+    saw TRIED, got None, and silently degraded to the fallback diarizer with
+    no log line at all."""
     global _PYANNOTE, _PYANNOTE_ID, _PYANNOTE_TRIED
     if _PYANNOTE is not None or _PYANNOTE_TRIED:
+        if _PYANNOTE is None:
+            # a previous attempt genuinely failed -- say so rather than
+            # returning None mutely, which is what made this invisible
+            print("[diarize] pyannote unavailable (an earlier load attempt "
+                 "failed); using the fallback diarizer", file=sys.stderr, flush=True)
         return _PYANNOTE
-    _PYANNOTE_TRIED = True
+    # Report the wait rather than appearing frozen: this load can take tens of
+    # seconds (and downloads the model on a cold cache), so a job that starts
+    # during startup warmup blocks here with nothing else to show for it.
+    if not _PYANNOTE_LOCK.acquire(blocking=False):
+        print("[diarize] a diarization model load is already in flight "
+             "(startup warmup?) -- waiting for it…", file=sys.stderr, flush=True)
+        t0 = time.time()
+        _PYANNOTE_LOCK.acquire()
+        print(f"[diarize] waited {time.time() - t0:.1f}s for that load",
+              file=sys.stderr, flush=True)
+    try:
+        # re-check: another thread may have completed the load while we waited
+        if _PYANNOTE is not None or _PYANNOTE_TRIED:
+            return _PYANNOTE
+        return _load_pyannote_locked()
+    finally:
+        _PYANNOTE_LOCK.release()
+
+
+def _load_pyannote_locked():
+    global _PYANNOTE, _PYANNOTE_ID, _PYANNOTE_TRIED
     try:
         # speechbrain 1.1 lazily imports optional integrations (k2/nlp/numba) that
         # aren't buildable on macOS; make those failures non-fatal.
@@ -403,10 +462,18 @@ def _load_pyannote():
         IU.LazyModule.ensure_module = _safe
     except Exception:
         pass
+    import torch
+    # pyannote's own checkpoint is trusted, and torch>=2.6 defaults
+    # weights_only=True, so it needs full unpickle to load. Patch torch.load
+    # only for the duration of THIS load and restore it in the finally below.
+    # It used to be replaced permanently and never restored, which (a) forced
+    # weights_only=False on every unrelated torch.load in the process for the
+    # rest of its life -- the exact footgun torch>=2.6 introduced that default
+    # to prevent -- and (b) re-wrapped the already-wrapped function on each
+    # subsequent call, nesting a new closure every time.
+    _orig_load = torch.load
+    torch.load = lambda *a, **k: _orig_load(*a, **{**k, "weights_only": False})
     try:
-        import torch
-        _orig_load = torch.load  # pyannote ckpt is trusted; allow full unpickle on torch>=2.6
-        torch.load = lambda *a, **k: _orig_load(*a, **{**k, "weights_only": False})
         from pyannote.audio import Pipeline
         explicit = os.environ.get("PYANNOTE_PIPELINE")
         candidates = [explicit] if explicit else list(PYANNOTE_PIPELINES)
@@ -510,6 +577,11 @@ def _load_pyannote():
         print(f"[diarize] pyannote failed to load: {type(e).__name__}: {e} -- "
              "falling back to resemblyzer diarization", file=sys.stderr, flush=True)
         _PYANNOTE = None
+    finally:
+        # restore the global torch.load, and only now mark the attempt as
+        # resolved -- see _load_pyannote()'s docstring
+        torch.load = _orig_load
+        _PYANNOTE_TRIED = True
     return _PYANNOTE
 
 
@@ -558,8 +630,14 @@ def _diarize_pyannote(audio):
         if os.environ.get("PYANNOTE_MAX_SPEAKERS"):
             kwargs["max_speakers"] = int(os.environ["PYANNOTE_MAX_SPEAKERS"])
 
+    print(f"[diarize] running {_PYANNOTE_ID or 'pyannote'} on "
+         f"{len(audio)/SAMPLE_RATE:.1f}s of audio{' ' + str(kwargs) if kwargs else ''}…",
+         file=sys.stderr, flush=True)
+    t0 = time.time()
     dia = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE},
                **kwargs)
+    print(f"[diarize] inference finished in {time.time() - t0:.1f}s",
+          file=sys.stderr, flush=True)
 
     # pyannote 4.x returns a DiarizeOutput carrying one or two annotations;
     # 3.x returns a bare Annotation. Prefer the EXCLUSIVE annotation when the

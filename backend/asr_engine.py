@@ -21,6 +21,7 @@ auto-detection ever guesses wrong for your machine.
 """
 import os
 import sys
+import threading
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,7 @@ BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5"))
 
 _ct2_model = None
 _active = None  # "mlx" | "ctranslate2", set on first use
+_SELECT_LOCK = threading.Lock()
 # Diagnostic snapshot of what _select() actually decided and why -- see
 # backend_info(). Populated as a side effect of _try_mlx()/_try_ctranslate2()
 # so a slow deploy can be checked (e.g. via /api/asr-status) without SSH+profiling.
@@ -97,9 +99,21 @@ def _try_ctranslate2() -> bool:
 
 
 def _select():
+    """Pick and load the ASR backend once. Thread-safe: the startup warmup
+    thread and a job thread can both reach this, and without the lock both
+    would build their own WhisperModel -- two full copies of the weights on
+    the GPU, with _ct2_model swapped underneath whichever one is mid-use."""
     global _active
     if _active is not None:
         return
+    with _SELECT_LOCK:
+        if _active is not None:
+            return
+        _select_locked()
+
+
+def _select_locked():
+    global _active
     requested = os.environ.get("ASR_BACKEND", "auto").lower()
     if requested in ("mlx", "auto") and _try_mlx():
         _active = "mlx"
