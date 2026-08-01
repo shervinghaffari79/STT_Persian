@@ -153,15 +153,14 @@ def unload() -> bool:
     with _SELECT_LOCK:
         if _ct2_model is None:
             return False
-        try:
-            # ctranslate2's Whisper exposes an explicit release; use it when
-            # present rather than relying purely on refcount timing
-            inner = getattr(_ct2_model, "model", None)
-            if inner is not None and hasattr(inner, "unload_model"):
-                inner.unload_model()
-        except Exception as e:
-            print(f"[mem] ctranslate2 unload_model() failed ({type(e).__name__}: {e}) "
-                  "-- dropping the reference anyway", file=sys.stderr, flush=True)
+        # Drop the reference and let CTranslate2's destructor release the
+        # device memory. Deliberately NOT calling ctranslate2's explicit
+        # unload_model() first: that tears the model down and the destructor
+        # then runs over an already-torn-down object. A double teardown in a
+        # native extension is not something a Python try/except can contain --
+        # it takes the worker process with it, which from the browser looks
+        # like the request failing and the backend restarting rather than an
+        # error being handled. One teardown, via refcount, is enough.
         _ct2_model = None
         _active = None      # force a fresh _select() (and reload) next time
     import gc

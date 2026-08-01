@@ -73,20 +73,32 @@ def _free_gpu_for_chat():
     whatever ASR and diarization left behind -- roughly 4.1 GiB of CTranslate2
     (invisible to PyTorch) plus pyannote. An unquantized 4B chat model does not
     fit in the remainder, which is the reported OOM. Both models reload lazily
-    on the next job."""
-    with _ACTIVE_LOCK:
-        busy = _ACTIVE_JOBS
-    if busy:
-        # Freeing now would yank the models out from under a running
-        # transcription. Let chat try anyway -- it may still fit, and if it
-        # does not the OOM handler reports something actionable.
-        print(f"[mem] {busy} transcription(s) running -- not freeing ASR models "
-              "for chat; chat may be short on VRAM until they finish", flush=True)
-        return
-    freed = pipeline.free_for_chat()
-    if freed:
-        print(f"[mem] freed {' + '.join(freed)} to make room for the chat model",
-              flush=True)
+    on the next job.
+
+    Best-effort by construction: this is a memory OPTIMIZATION, so any failure
+    in it must degrade to "chat runs with less VRAM", never to a failed
+    request. It is called before the streaming generator starts, so an
+    exception escaping here would surface as a bare 500 on /api/chat with the
+    real cause only in the server console -- the chat would fail for a reason
+    that has nothing to do with chat."""
+    try:
+        with _ACTIVE_LOCK:
+            busy = _ACTIVE_JOBS
+        if busy:
+            # Freeing now would yank the models out from under a running
+            # transcription. Let chat try anyway -- it may still fit, and if it
+            # does not the OOM handler reports something actionable.
+            print(f"[mem] {busy} transcription(s) running -- not freeing ASR models "
+                  "for chat; chat may be short on VRAM until they finish", flush=True)
+            return
+        freed = pipeline.free_for_chat()
+        if freed:
+            print(f"[mem] freed {' + '.join(freed)} to make room for the chat model",
+                  flush=True)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[mem] could not free GPU memory for chat ({type(e).__name__}: {e}) -- "
+              "continuing anyway; chat may be short on VRAM", flush=True)
 
 
 def _set(job_id, **kw):
