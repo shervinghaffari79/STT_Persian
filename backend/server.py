@@ -51,6 +51,43 @@ app.add_middleware(
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
+# Number of transcriptions currently running. Chat frees the ASR/diarization
+# models to make room for itself (see _free_gpu_for_chat), which must never
+# happen underneath a job that is mid-transcription.
+_ACTIVE_JOBS = 0
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _job_delta(n: int) -> int:
+    global _ACTIVE_JOBS
+    with _ACTIVE_LOCK:
+        _ACTIVE_JOBS += n
+        return _ACTIVE_JOBS
+
+
+def _free_gpu_for_chat():
+    """Drop Whisper + pyannote before generating a chat reply.
+
+    server.py has always called chat.unload() before a transcription, but
+    nothing did the reverse, so on a 16GB card the chat model had to fit in
+    whatever ASR and diarization left behind -- roughly 4.1 GiB of CTranslate2
+    (invisible to PyTorch) plus pyannote. An unquantized 4B chat model does not
+    fit in the remainder, which is the reported OOM. Both models reload lazily
+    on the next job."""
+    with _ACTIVE_LOCK:
+        busy = _ACTIVE_JOBS
+    if busy:
+        # Freeing now would yank the models out from under a running
+        # transcription. Let chat try anyway -- it may still fit, and if it
+        # does not the OOM handler reports something actionable.
+        print(f"[mem] {busy} transcription(s) running -- not freeing ASR models "
+              "for chat; chat may be short on VRAM until they finish", flush=True)
+        return
+    freed = pipeline.free_for_chat()
+    if freed:
+        print(f"[mem] freed {' + '.join(freed)} to make room for the chat model",
+              flush=True)
+
 
 def _set(job_id, **kw):
     with JOBS_LOCK:
@@ -93,14 +130,16 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
 
     correct_fn = correct.correct_segment if gpt_correct else None
 
+    _job_delta(+1)
     try:
         # register the live list itself; on_segment appends to it in place
         _set(job_id, state="processing", progress=2, message="Starting…",
              partial=partial, speakers=[])
-        # The chat LLM caches ~8GB of fp16 weights for the process lifetime once
+        # The chat LLM caches ~9GB of fp16 weights for the process lifetime once
         # the AI Analysis panel has been used. On a 16GB card that is what turns
         # a long file into a CUDA OOM -- ASR + diarization are left under half
         # the board. Drop it here; the next /api/chat request reloads it lazily.
+        # (_free_gpu_for_chat is the mirror of this, run before chat replies.)
         if chat.unload():
             print("[mem] unloaded chat model to free GPU for transcription", flush=True)
         result = pipeline.transcribe(tmp_path, diarize=diarize, progress=progress,
@@ -112,6 +151,7 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
         traceback.print_exc()
         _set(job_id, state="error", error=str(e), message="Failed")
     finally:
+        _job_delta(-1)
         try:
             Path(tmp_path).unlink(missing_ok=True)
         except Exception:
@@ -202,6 +242,20 @@ def health():
             "gpt_correct_available": bool(os.environ.get("OPENAI_API_KEY"))}
 
 
+@app.get("/api/gpu-status")
+def gpu_status():
+    """What is actually resident on the GPU right now.
+
+    `non_torch_gib` is the important column: CTranslate2 (Whisper) allocates
+    outside PyTorch's allocator, so it never appears in a torch OOM message and
+    is invisible to torch.cuda.empty_cache(). On the reported OOM that was
+    ~4.1 GiB -- the reason the numbers in that error didn't add up to the card."""
+    with _ACTIVE_LOCK:
+        busy = _ACTIVE_JOBS
+    return {"active_jobs": busy, "chat_loaded": chat.backend_info().get("loaded", False),
+            **pipeline.gpu_report()}
+
+
 @app.get("/api/asr-status")
 def asr_status():
     """Diagnostic: loads the ASR backend right now (same code path used
@@ -252,12 +306,29 @@ async def chat_stream(req: Request):
     messages = body.get("messages", [])
     transcript = body.get("transcript", "") or ""
 
+    _free_gpu_for_chat()
+
     def gen():
         try:
             for tok in chat.stream_chat(messages, transcript):
                 yield tok
         except Exception as e:  # surface errors inline so the UI can show them
-            yield f"\n[chat error: {e}]"
+            msg = str(e)
+            if "out of memory" in msg.lower():
+                # Leave the card clean: a failed generation otherwise keeps the
+                # partially-allocated chat model resident, so the NEXT request
+                # -- including a transcription -- starts against a nearly full
+                # GPU and fails too, which is what made this look like the whole
+                # backend wedging rather than one request failing.
+                chat.unload()
+                print(f"[mem] chat OOM -- unloaded chat model. {pipeline.gpu_report()}",
+                      flush=True)
+                yield ("\n[chat error: GPU out of memory. The transcription models "
+                       "were freed first, so this is the chat model alone not "
+                       "fitting. It has been unloaded, so the next request should "
+                       "work. See /api/gpu-status.]")
+            else:
+                yield f"\n[chat error: {e}]"
 
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
 
@@ -265,9 +336,12 @@ async def chat_stream(req: Request):
 @app.post("/api/chat/title")
 async def chat_title(req: Request):
     body = await req.json()
+    _free_gpu_for_chat()
     try:
         return {"title": chat.make_title(body.get("transcript", "") or "")}
-    except Exception:
+    except Exception as e:
+        if "out of memory" in str(e).lower():
+            chat.unload()
         return {"title": "تحلیل جدید"}
 
 

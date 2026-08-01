@@ -177,6 +177,65 @@ def _unload_pyannote():
     print("[mem] unloaded pyannote after diarization", file=sys.stderr, flush=True)
 
 
+def free_for_chat() -> list:
+    """Release the transcription models so the chat LLM has room.
+
+    The mirror image of what server.py already does before a transcription
+    (chat.unload()). Both directions are needed on a 16GB card: Whisper's
+    CTranslate2 weights plus pyannote plus an unquantized 4B chat model do not
+    fit together, and nothing here is needed while a chat reply is generating.
+
+    Returns the names of what was actually freed, for logging. Everything
+    reloads lazily on the next transcription."""
+    freed = []
+    try:
+        import asr_engine
+        if asr_engine.unload():
+            freed.append("whisper")
+    except Exception as e:
+        print(f"[mem] could not unload Whisper: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+    global _PYANNOTE, _PYANNOTE_TRIED
+    if _PYANNOTE is not None:
+        with _PYANNOTE_LOCK:
+            if _PYANNOTE is not None:
+                _PYANNOTE = None
+                _PYANNOTE_TRIED = False   # allow a reload on the next job
+                freed.append("pyannote")
+    import gc
+    gc.collect()
+    _free_gpu()
+    return freed
+
+
+def gpu_report() -> dict:
+    """What is actually on the card right now.
+
+    Reports PyTorch's own numbers alongside the driver-level total via NVML,
+    because the gap between them IS the CTranslate2 allocation -- the block
+    that never appears in a torch OOM message and is the usual reason the
+    arithmetic in one of those messages doesn't add up."""
+    out = {}
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {"cuda": False}
+        out["cuda"] = True
+        free_b, total_b = torch.cuda.mem_get_info()
+        gib = 1024 ** 3
+        out["total_gib"] = round(total_b / gib, 2)
+        out["free_gib"] = round(free_b / gib, 2)
+        out["torch_allocated_gib"] = round(torch.cuda.memory_allocated() / gib, 2)
+        out["torch_reserved_gib"] = round(torch.cuda.memory_reserved() / gib, 2)
+        used = (total_b - free_b) / gib
+        out["used_gib"] = round(used, 2)
+        # anything in use that PyTorch does not account for is CTranslate2 &c.
+        out["non_torch_gib"] = round(max(0.0, used - out["torch_reserved_gib"]), 2)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def decode_audio(path: str) -> np.ndarray:
     """Any audio/video container -> 16 kHz mono float32 via ffmpeg."""
     cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", str(path),

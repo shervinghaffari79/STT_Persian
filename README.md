@@ -113,6 +113,7 @@ The frontend proxies `/api/*` to the backend (see `vite.config.ts`).
 | `POST` | `/api/chat/title` | `{ transcript }` → `{ title }` |
 | `GET` | `/api/health` | model presence check (`gpt_correct_available` reflects whether `OPENAI_API_KEY` is set) |
 | `GET` | `/api/status/{job_id}` (`?since=N`) | pass `since` = segments already held; only newer ones come back, with `partial_total`. Omit for the full snapshot |
+| `GET` | `/api/gpu-status` | live VRAM split — `non_torch_gib` is the CTranslate2 block PyTorch can't see — plus `active_jobs` and `chat_loaded` |
 | `GET` | `/api/asr-status` | loads the ASR backend now, reports actual device/compute_type (e.g. confirms CUDA isn't silently falling back to CPU) |
 | `GET` | `/api/chat-status` | loads the chat LLM now, reports actual model/device/quantization -- "which language model is loaded" answered directly |
 | `GET` | `/api/diarizer-status` | loads pyannote now, reports which pipeline (community-1 / 3.1) and whether exclusive diarization is active |
@@ -340,6 +341,43 @@ check for it before trading accuracy for speed.
 | `ASR_MIN_CHUNK_S` | `0.5` | Shortest standalone chunk; shorter turn slivers fold into a neighbour |
 | `DEDUPE_THRESHOLD` | `0.6` | Similarity above which an adjacent repeated segment is dropped |
 | `CT2_COMPUTE_TYPE` | `int8_float16` on CUDA | Override the compute type |
+
+### GPU memory: who holds what
+
+On a 16 GB card the three models cannot all be resident at once, so the backend
+swaps them:
+
+| When | Freed | Reloads |
+|---|---|---|
+| a transcription starts | chat LLM (~9 GB) | on the next chat request |
+| a chat request starts | Whisper + pyannote | on the next transcription |
+
+Both directions are needed. Only the first existed originally, which is why an
+unquantized chat model OOM'd: Whisper's CTranslate2 weights stayed resident
+through every chat reply. **CTranslate2 allocates outside PyTorch's allocator**,
+so that block never appears in a torch OOM message and `torch.cuda.empty_cache()`
+cannot reclaim it — on the reported failure it was ~4.1 GB, which is exactly why
+the numbers in that error don't add up to the card's capacity.
+
+If a transcription is *running* when a chat request arrives, the ASR models are
+deliberately **not** freed (that would break the job) — chat may then be short on
+VRAM until the job finishes. `GET /api/gpu-status` shows the live split,
+including `non_torch_gib`:
+
+```bash
+curl http://127.0.0.1:8000/api/gpu-status
+```
+
+A chat OOM now unloads the chat model on the way out, so the next request starts
+against a clean card instead of inheriting a nearly-full one.
+
+Worth setting on the server, as the OOM message itself suggests — it lets the
+allocator grow segments instead of fragmenting, which matters when models are
+repeatedly loaded and dropped:
+
+```powershell
+$env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+```
 
 ### Chat model knobs
 

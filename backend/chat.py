@@ -397,7 +397,13 @@ def stream_chat(messages, transcript="", max_tokens=1024, temperature=0.7):
         try:
             raw_output.append(model.generate(**gen_kwargs))
         except Exception as e:
-            error.append(e)
+            # Store the MESSAGE, not the exception object. An exception keeps
+            # its __traceback__, the traceback keeps every frame, and those
+            # frames keep the activations and KV cache that just failed to fit.
+            # Holding it here would pin exactly the GPU memory we are trying to
+            # recover from -- so a CUDA OOM would make the next attempt more
+            # likely to OOM, not less.
+            error.append(f"{type(e).__name__}: {e}")
             streamer.end()
 
     thread = threading.Thread(target=_run, daemon=True)
@@ -407,7 +413,15 @@ def stream_chat(messages, transcript="", max_tokens=1024, temperature=0.7):
             yield text
     thread.join()
     if error:
-        raise RuntimeError(f"generation failed: {error[0]}") from error[0]
+        # drop references to the failed generation's tensors before raising,
+        # so the caller's recovery (unload + empty_cache) can actually reclaim
+        del gen_kwargs, inputs
+        raw_output.clear()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        raise RuntimeError(f"generation failed: {error[0]}")
     if raw_output:
         _check_thinking_leak(tok, raw_output[0], inputs["input_ids"].shape[-1])
 

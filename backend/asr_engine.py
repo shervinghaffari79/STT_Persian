@@ -133,6 +133,43 @@ def active_backend() -> str:
     return _active
 
 
+def unload() -> bool:
+    """Free the Whisper weights from the GPU. Returns True if anything was freed.
+
+    The counterpart to chat.unload(). Transcription has always dropped the chat
+    model before starting, but nothing ever dropped Whisper before a chat
+    request, so the two peaks overlapped in one direction only -- which is what
+    puts a T4 over the line once the chat model is unquantized.
+
+    CTranslate2 allocates OUTSIDE PyTorch's caching allocator, so this memory is
+    invisible to torch.cuda.memory_allocated() and unreachable by
+    torch.cuda.empty_cache(): on the reported OOM, ~4.1 GiB of the card was held
+    here while PyTorch could only see (and only report) its own 10.4 GiB.
+    Releasing it means dropping the model object itself.
+
+    The next transcribe_chunk() reloads lazily -- a few seconds -- so this only
+    trades reload time, never correctness."""
+    global _ct2_model, _active
+    with _SELECT_LOCK:
+        if _ct2_model is None:
+            return False
+        try:
+            # ctranslate2's Whisper exposes an explicit release; use it when
+            # present rather than relying purely on refcount timing
+            inner = getattr(_ct2_model, "model", None)
+            if inner is not None and hasattr(inner, "unload_model"):
+                inner.unload_model()
+        except Exception as e:
+            print(f"[mem] ctranslate2 unload_model() failed ({type(e).__name__}: {e}) "
+                  "-- dropping the reference anyway", file=sys.stderr, flush=True)
+        _ct2_model = None
+        _active = None      # force a fresh _select() (and reload) next time
+    import gc
+    gc.collect()
+    print("[mem] unloaded Whisper (ctranslate2) from the GPU", file=sys.stderr, flush=True)
+    return True
+
+
 def backend_info() -> dict:
     """Diagnostic snapshot of which ASR backend/device/compute_type actually
     got selected -- call active_backend() (or transcribe once) first if this
