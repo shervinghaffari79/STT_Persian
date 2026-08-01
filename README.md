@@ -344,39 +344,49 @@ check for it before trading accuracy for speed.
 
 ### GPU memory: who holds what
 
-All three models stay **resident** — nothing is unloaded to make room for chat.
-That works because the chat LLM runs in 8-bit:
+The chat LLM runs **unquantized (fp16)**. Room is made by unloading the
+**diarizer only** before a chat reply:
 
 ```
-Whisper 4.11 + pyannote 1.10 + chat 5.00 (8-bit) = 10.21 / 14.83 GB -> 4.62 GB free  OK
-Whisper 4.11 + pyannote 1.10 + chat 7.97 (fp16)  = 13.18 / 14.83 GB -> 1.65 GB free  OOMs
+during chat: Whisper 4.11 + chat 7.97 (fp16) = 12.08 / 14.83 GB -> 2.75 GB free
+             (pyannote 1.10 released; reloads on the next transcription)
 ```
 
-Swapping models in and out around each request was tried instead, and it
-repeatedly destabilised this deployment (a native crash when the CTranslate2
-model was torn down, then a 500 that could not be traced from the code). The
-memory is bought once, up front, with quantization.
+> ⚠️ **Whisper is never unloaded.** Releasing the CTranslate2 model — by
+> dropping the object *or* via its own `unload_model()` — repeatedly
+> destabilised this deployment, once as a native crash that killed the worker
+> with no Python traceback at all. pyannote is pure PyTorch: freeing it is
+> thread-safe, has no native teardown, and is reversible through the normal
+> lazy load. The diarizer is also finished long before anyone opens the chat
+> panel, so releasing it costs nothing for the current job.
 
-**8-bit is slower than fp16** — `LLM.int8()` dequantizes on the fly and runs a
-mixed-precision path for outlier channels, and only pays off above a
-hidden-dimension crossover that Qwen3.5-4B (hidden size 2560) sits below. That
-is the deliberate trade: some tokens/sec for a configuration that fits and
-stays up. `CHAT_8BIT=0` restores fp16 if you would rather manage VRAM another
-way.
+That leaves ~2.75 GB for KV cache and activations — enough for normal replies,
+but a long transcript can still exceed it. **The OOM path is therefore built to
+be survivable rather than prevented:** the chat model is dropped *outside* the
+exception handler (see below), the allocator is emptied, and the next request —
+chat or transcription — starts from a clean card. `CHAT_8BIT=1` halves the chat
+footprint if your transcripts routinely exceed the headroom.
 
-> `bitsandbytes` must be installed or the 8-bit load silently falls back to
-> fp16 — `chat.py` logs `[chat] 8-bit requested but unavailable`, and the
-> symptom is an OOM later rather than an install error. It is in
-> `requirements.txt`.
+**Nothing gets stuck.** A watchdog fails any job that stops progressing for
+`JOB_STALL_TIMEOUT` seconds (default 1800). A wedged CUDA call after an OOM
+never returns, so without this the job sits in `processing` forever and the UI
+spins for ~48 minutes with no explanation. The job is marked `error` with the
+stage it stalled at and a VRAM reading, so the client stops and shows a reason.
+It cannot unwedge the worker thread — only a restart does that — but it frees
+the user.
 
-The one remaining unload: the chat model is dropped before each transcription
-(it predates the chat-side swapping and has never misbehaved), and reloads
-lazily on the next chat request.
+> ⚠️ **Recovering from an OOM must happen outside the `except` block.** While a
+> handler runs, Python holds the exception as the *current* exception; its
+> traceback keeps the generating frame alive, and that frame holds the model. An
+> `unload()` called inside the handler clears the module global and frees
+> nothing — observed as 7.97 GB still allocated on the `gpu_report` printed
+> immediately after `"unloaded chat model"`. Clearing `e.__traceback__` is *not*
+> sufficient; only leaving the handler releases it.
 
 `GET /api/gpu-status` shows the live split. `non_torch_gib` is the CTranslate2
-block — it allocates outside PyTorch's allocator, so it never appears in a
-torch OOM message and `torch.cuda.empty_cache()` cannot reclaim it, which is
-why the numbers in such an error never add up to the card.
+block — it allocates outside PyTorch's allocator, so it never appears in a torch
+OOM message and `torch.cuda.empty_cache()` cannot reclaim it, which is why the
+numbers in such an error never add up to the card.
 
 Worth setting on the server, as the OOM message itself suggests:
 
@@ -400,8 +410,9 @@ fp16 tensor-core support.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `CHAT_8BIT` | `1` (on) | 8-bit weights, ~8 GB → ~5 GB, so all models stay resident. `0` = fp16: faster, but will not fit alongside Whisper + pyannote on 16 GB |
+| `CHAT_8BIT` | `0` (off) | fp16 (faster). `1` = 8-bit, ~8 GB → ~5 GB, slower — use if long transcripts exhaust the ~2.75 GB headroom |
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
+| `JOB_STALL_TIMEOUT` | `1800` | Seconds without progress before a job is failed so the UI stops waiting |
 | `CHAT_BACKEND` | `auto` | `mlx` \| `transformers` if auto-detection guesses wrong |
 | `HF_CHAT_MODEL` | `Qwen/Qwen3.5-4B` | Override the Windows/Linux chat model |
 

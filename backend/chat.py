@@ -145,33 +145,30 @@ def _ensure():
         dtype = torch.float16 if device == "cuda" else torch.float32
         _TOK = AutoTokenizer.from_pretrained(HF_MODEL)
 
-        # 8-bit is ON by default on CUDA, and it is a deliberate speed-for-VRAM
-        # trade rather than a free win.
+        # Quantization is OFF by default: the model runs at full fp16 on CUDA,
+        # which is the faster path. Room is made by unloading the DIARIZER
+        # before a chat reply (server.py) -- Whisper is never touched, because
+        # tearing down the CTranslate2 model crashed this deployment outright.
         #
-        # The cost: LLM.int8() is a footprint optimization, not a speed one --
-        # it dequantizes on the fly and runs a mixed-precision decomposition
-        # for outlier channels, and only pays for itself above a hidden-
-        # dimension crossover. Qwen3.5-4B's hidden size is 2560, below it, so
-        # this is slower than fp16 (a 7B on an A100 measured ~6.7 tok/s at
-        # 8-bit vs ~16.7 tok/s at fp16).
+        # That leaves roughly 2.7 GB for KV cache and activations, which is
+        # enough for normal replies but can be exceeded on a long transcript.
+        # The OOM path is therefore built to be survivable rather than
+        # prevented: the model is dropped, the allocator is emptied, and the
+        # next request -- chat or transcription -- starts from a clean card.
+        # CHAT_8BIT=1 halves the footprint (~8 GB -> ~5 GB) at a real cost in
+        # tokens/sec if that headroom is not enough for your transcripts.
         #
-        # Why it is worth paying anyway: it is what lets all three models stay
-        # RESIDENT on a 16GB card. Whisper 4.11 + pyannote 1.10 + chat 5.00 =
-        # 10.21 GiB, leaving ~4.6 GiB for KV cache and activations. At fp16 the
-        # chat model alone is ~8 GiB and the same three total 13.18 GiB, which
-        # left ~1.65 GiB and OOM'd during generation. The alternative was
-        # swapping models in and out around every request, and that repeatedly
-        # destabilised this deployment -- so the memory is bought once, up
-        # front, and nothing is unloaded for chat any more.
-        #
-        # CHAT_8BIT=0 restores fp16 (faster, but expect to manage VRAM another
-        # way); CHAT_DEVICE=cpu keeps it off the GPU entirely.
+        # LLM.int8() is a footprint optimization, not a speed one: it
+        # dequantizes on the fly and runs a mixed-precision path for outlier
+        # channels, and only pays off above a hidden-dimension crossover that
+        # Qwen3.5-4B (hidden size 2560) sits below -- so it is SLOWER than fp16
+        # here, which is why it is not the default.
         #
         # Quantized loads must NOT be followed by .to(device): bitsandbytes
         # places the weights itself through accelerate, and moving the module
         # afterwards raises. Hence the separate device_map path below.
         quant_cfg = None
-        if device == "cuda" and os.environ.get("CHAT_8BIT", "1") != "0":
+        if device == "cuda" and os.environ.get("CHAT_8BIT", "0") != "0":
             try:
                 import bitsandbytes  # noqa: F401 -- availability probe only
                 from transformers import BitsAndBytesConfig

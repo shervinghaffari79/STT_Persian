@@ -177,6 +177,33 @@ def _unload_pyannote():
     print("[mem] unloaded pyannote after diarization", file=sys.stderr, flush=True)
 
 
+def free_diarizer() -> bool:
+    """Drop the diarization pipeline to make room for the chat model.
+    Returns True if something was actually released.
+
+    ONLY pyannote. Whisper is deliberately never touched from here: releasing
+    the CTranslate2 model -- whether by dropping the object or via its own
+    unload_model() -- repeatedly destabilised this deployment, once as a native
+    crash with no Python traceback at all. pyannote is pure PyTorch, so freeing
+    it is thread-safe, has no native teardown, and is reversible: the next
+    transcription reloads it through the normal lazy path.
+
+    Diarization is finished long before anyone opens the chat panel, so this
+    costs nothing for the current job and only a reload on the next one."""
+    global _PYANNOTE, _PYANNOTE_TRIED
+    if _PYANNOTE is None:
+        return False
+    with _PYANNOTE_LOCK:
+        if _PYANNOTE is None:
+            return False
+        _PYANNOTE = None
+        _PYANNOTE_TRIED = False   # allow the reload
+    import gc
+    gc.collect()
+    _free_gpu()
+    return True
+
+
 def gpu_report() -> dict:
     """What is actually on the card right now.
 

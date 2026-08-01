@@ -64,9 +64,36 @@ def _job_delta(n: int) -> int:
         return _ACTIVE_JOBS
 
 
+def _free_diarizer_for_chat():
+    """Release pyannote before generating a chat reply.
+
+    Best-effort by construction: this is a memory optimization, so a failure
+    here must degrade to "chat runs with less VRAM", never to a failed request.
+    It runs before the streaming generator is created, so anything escaping
+    would become a bare 500 whose cause lives only in the console.
+
+    Only the diarizer. Whisper stays resident -- see pipeline.free_diarizer()."""
+    try:
+        with _ACTIVE_LOCK:
+            busy = _ACTIVE_JOBS
+        if busy:
+            # never pull a model out from under a running transcription
+            print(f"[mem] {busy} transcription(s) running -- leaving the diarizer "
+                  "loaded; chat may be short on VRAM until they finish", flush=True)
+            return
+        if pipeline.free_diarizer():
+            print("[mem] freed the diarizer to make room for the chat model", flush=True)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[mem] could not free the diarizer ({type(e).__name__}: {e}) -- "
+              "continuing anyway", flush=True)
+
+
 def _set(job_id, **kw):
     with JOBS_LOCK:
         JOBS.setdefault(job_id, {}).update(kw)
+        # heartbeat for the stall watchdog -- every state change refreshes it
+        JOBS[job_id]["updated"] = time.time()
 
 
 def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_correct: bool):
@@ -98,6 +125,7 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
         # on the same thread doing the transcription.
         with JOBS_LOCK:
             partial.append(seg)
+            JOBS.setdefault(job_id, {})["updated"] = time.time()
             if seg["speaker"] not in seen_speakers:
                 seen_speakers.add(seg["speaker"])
                 JOBS.setdefault(job_id, {})["speakers"] = sorted(
@@ -132,6 +160,54 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
             Path(tmp_path).unlink(missing_ok=True)
         except Exception:
             pass
+
+
+# A job that stops making progress for this long is declared stuck. Generous,
+# because a legitimately quiet stretch exists: diarization on a long recording
+# runs for minutes with no per-chunk callback (37s for 14 minutes of audio, so
+# a 2h file is several minutes). 30 min is far past that.
+STALL_TIMEOUT_S = float(os.environ.get("JOB_STALL_TIMEOUT", "1800"))
+
+
+def _watchdog():
+    """Fail jobs that have stopped progressing instead of leaving them 'processing'.
+
+    Every state change and every emitted segment refreshes a heartbeat. If one
+    goes quiet past STALL_TIMEOUT_S the job is marked failed, which is what the
+    client needs: `state == "error"` makes it show the reason and stop, whereas
+    a job stuck in "processing" leaves it polling for up to ~48 minutes with a
+    spinner and no explanation. A wedged CUDA call after an OOM is exactly the
+    case -- the GPU never comes back, so nothing else will ever end that job.
+
+    This does not unwedge the worker thread (nothing can, from outside), but it
+    frees the USER, and it puts a dated reason and a VRAM reading in the log."""
+    while True:
+        time.sleep(30)
+        try:
+            now = time.time()
+            stalled = []
+            with JOBS_LOCK:
+                for jid, job in JOBS.items():
+                    if job.get("state") != "processing":
+                        continue
+                    quiet = now - (job.get("updated") or now)
+                    if quiet > STALL_TIMEOUT_S:
+                        # capture WHERE it stalled before overwriting message,
+                        # otherwise the reason reads 'stalled at "Failed"'
+                        where = job.get("message") or "?"
+                        job["state"] = "error"
+                        job["message"] = "Failed"
+                        job["error"] = (
+                            f"No progress for {quiet/60:.0f} minutes at \"{where}\" -- "
+                            "the job is stuck and has been failed so the UI stops "
+                            "waiting. The usual cause is the GPU being exhausted (see "
+                            "/api/gpu-status); restarting the backend clears it.")
+                        stalled.append((jid, quiet, where))
+            for jid, quiet, where in stalled:
+                print(f"[watchdog] job {jid} stalled {quiet/60:.1f} min at {where!r} "
+                      f"-- marked failed. {pipeline.gpu_report()}", flush=True)
+        except Exception:
+            traceback.print_exc()   # a watchdog must never be the thing that dies
 
 
 def _warmup():
@@ -205,6 +281,8 @@ def _warmup():
 
 @app.on_event("startup")
 def _on_startup():
+    # always on: its whole job is to catch the case where something else wedged
+    threading.Thread(target=_watchdog, daemon=True).start()
     if os.environ.get("WARMUP", "1") == "0":
         print("[warmup] disabled (WARMUP=0) -- models load on first job", flush=True)
         return
@@ -306,6 +384,9 @@ async def chat_stream(req: Request):
         messages = body.get("messages", [])
         transcript = body.get("transcript", "") or ""
 
+        # off the event loop: teardown is blocking and would stall other requests
+        await run_in_threadpool(_free_diarizer_for_chat)
+
     except Exception as e:
         traceback.print_exc()
         detail = f"{type(e).__name__}: {e}"
@@ -361,6 +442,7 @@ async def chat_stream(req: Request):
 @app.post("/api/chat/title")
 async def chat_title(req: Request):
     body = await req.json()
+    await run_in_threadpool(_free_diarizer_for_chat)
     try:
         return {"title": chat.make_title(body.get("transcript", "") or "")}
     except Exception as e:
