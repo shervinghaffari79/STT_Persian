@@ -453,6 +453,34 @@ Only a ~14-character tail is ever held, and a `[` that clearly isn't a citation
 (`[نامفهوم]`, long bracketed text) is released immediately, so streaming feels
 unchanged. Complete citations pass through byte-for-byte.
 
+### Giving the LLM the whole card (CPU-only ASR)
+
+If chat still OOMs, the remaining lever is to keep **Whisper and the diarizer
+off the GPU entirely** so the chat model has all of it:
+
+```powershell
+$env:ASR_DEVICE="cpu"        # Whisper on CPU  (frees ~4.1 GB)
+$env:PYANNOTE_DEVICE="cpu"   # diarizer on CPU (frees ~1.1 GB)
+```
+
+```
+default : Whisper 4.09 + chat 7.97 = 12.06 / 14.83 GB -> 2.77 GB headroom
+CPU ASR : chat 7.97 alone          =  7.97 / 14.83 GB -> 6.86 GB headroom  (2.5x)
+```
+
+**The trade is real and it is not small.** CTranslate2 int8 on CPU runs at
+roughly real-time, versus several times faster than real-time on the T4 — a
+15-minute recording goes from a couple of minutes to something closer to its
+own length, and pyannote on CPU is slower again. Transcription is the product's
+main job, so this is worth doing only if the chat panel matters more than
+turnaround, or if the machine has cores to spare.
+
+Before reaching for it, check the `[chat] prompt N tokens (~X GB KV cache)`
+line the backend now logs before every generation. It separates "the chat model
+does not fit" from "this particular transcript is too long", which have
+different fixes — a large prompt is better solved with `CHAT_8BIT=1` or a
+shorter transcript than by moving ASR to CPU.
+
 ### Chat model knobs
 
 The chat LLM runs **unquantized** (fp16 on CUDA). 8-bit was previously the
@@ -474,6 +502,7 @@ fp16 tensor-core support.
 | `JOB_STALL_TIMEOUT` | `300` | Seconds without progress before a job is failed so the UI stops waiting |
 | `DECODE_TIMEOUT` | `600` | Seconds ffmpeg may take before the decode is abandoned as a malformed container |
 | `CHAT_STATELESS` | `1` (on) | Each question answered independently — prior turns are not sent. `0` keeps the full conversation |
+| `ASR_DEVICE` | `auto` | `cpu` keeps Whisper off the GPU (frees ~4.1 GB for chat, much slower transcription) |
 | `CHAT_MAX_TOKENS` | `350` | Hard ceiling on a reply. Backstop for the brevity instruction; raise it if answers are cut mid-sentence |
 | `CHAT_BACKEND` | `auto` | `mlx` \| `transformers` if auto-detection guesses wrong |
 | `HF_CHAT_MODEL` | `Qwen/Qwen3.5-4B` | Override the Windows/Linux chat model |

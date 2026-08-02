@@ -66,20 +66,32 @@ def _try_ctranslate2() -> bool:
     if not CT2_MODEL_DIR.exists():
         print(f"[asr] CT2 model dir not found: {CT2_MODEL_DIR}", file=sys.stderr, flush=True)
         return False
-    try:
-        cuda_count = ctranslate2.get_cuda_device_count()
-    except Exception as e:
-        # This is the single most common way "GPU present, but everything is
-        # slow" happens with zero other symptoms: ctranslate2 bundles its own
-        # CUDA runtime, separate from PyTorch's, and can fail to find a
-        # compatible cuDNN/cuBLAS on Windows (driver/toolkit mismatch, missing
-        # MSVC redistributables) without raising past this call -- it just
-        # reports 0 devices, and this used to fall back to CPU with nothing in
-        # the log to say why. Logging the exception IS the fix for "why is
-        # this on CPU".
-        print(f"[asr] ctranslate2.get_cuda_device_count() failed: "
-              f"{type(e).__name__}: {e} -- falling back to CPU", file=sys.stderr, flush=True)
+    # ASR_DEVICE=cpu keeps Whisper off the GPU entirely, which hands its ~4.1 GB
+    # to the chat model. That is the "Whisper and the diarizer on CPU, the LLM
+    # alone on the GPU" arrangement -- combine with PYANNOTE_DEVICE=cpu. It
+    # trades transcription speed (CPU int8 runs roughly real-time, versus
+    # several times faster than real-time on the T4) for a chat model that has
+    # the whole card and cannot run out of room.
+    forced = os.environ.get("ASR_DEVICE", "auto").lower()
+    if forced == "cpu":
+        print("[asr] ASR_DEVICE=cpu -- keeping Whisper off the GPU", file=sys.stderr, flush=True)
         cuda_count = 0
+    else:
+        try:
+            cuda_count = ctranslate2.get_cuda_device_count()
+        except Exception as e:
+            # This is the single most common way "GPU present, but everything is
+            # slow" happens with zero other symptoms: ctranslate2 bundles its own
+            # CUDA runtime, separate from PyTorch's, and can fail to find a
+            # compatible cuDNN/cuBLAS on Windows (driver/toolkit mismatch, missing
+            # MSVC redistributables) without raising past this call -- it just
+            # reports 0 devices, and this used to fall back to CPU with nothing in
+            # the log to say why. Logging the exception IS the fix for "why is
+            # this on CPU".
+            print(f"[asr] ctranslate2.get_cuda_device_count() failed: "
+                  f"{type(e).__name__}: {e} -- falling back to CPU",
+                  file=sys.stderr, flush=True)
+            cuda_count = 0
     device = "cuda" if cuda_count > 0 else "cpu"
     if device == "cuda":
         # Our CT2 model is already int8-quantized. "int8_float16" runs the

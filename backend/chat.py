@@ -469,6 +469,19 @@ def _stream_tokens(messages, transcript="", max_tokens=None, temperature=0.7):
 
     msgs = _fit_to_context(tok, messages, transcript, max_tokens, _context_window(model, tok))
     inputs = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True, enable_thinking=False).to(model.device)
+
+    # Report what generation is actually being asked to hold. An OOM here is
+    # opaque otherwise: the message names the failed allocation but not the
+    # prompt that caused it, so "the chat model does not fit" and "this
+    # particular transcript is too long" look identical. Qwen3.5's vocabulary is
+    # 248,320, which makes the prefill logits tensor alone
+    # prompt_tokens x 248320 x 2 bytes when a build materialises logits for every
+    # position -- worth seeing next to the KV estimate before blaming the weights.
+    n_prompt = int(inputs["input_ids"].shape[-1])
+    kv_gb = n_prompt * 4 * 256 * 2 * 2 * 8 / 1e9   # 8 full-attn layers, 4 KV heads, d=256, fp16
+    print(f"[chat] prompt {n_prompt} tokens (~{kv_gb:.2f} GB KV cache), "
+          f"generating up to {max_tokens}", file=sys.stderr, flush=True)
+
     streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
     gen_kwargs = dict(**inputs, max_new_tokens=max_tokens, streamer=streamer,
                       do_sample=temperature > 0, temperature=max(temperature, 0.01))
