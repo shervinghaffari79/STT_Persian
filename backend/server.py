@@ -21,6 +21,23 @@ endpoint, so don't bind this to 0.0.0.0 without adding your own access control
 in front of it first.
 """
 import os
+
+# MUST run before anything imports torch: PyTorch reads this once, when it
+# initializes its CUDA allocator, and ignores later changes. pipeline/chat/
+# correct all import torch lazily inside functions, so this module-level
+# assignment is genuinely early enough -- do not move it below those imports.
+#
+# Without expandable_segments the caching allocator keeps a pool of fixed-size
+# blocks. A request whose tensors are a different SHAPE cannot reuse them, so
+# it takes fresh segments from the driver and reserved memory ratchets upward
+# even though allocated memory is flat. That is exactly the reported symptom:
+# asking more questions in the SAME chat is free (identical prompt shape every
+# time, because history is not resent), while opening a NEW chat raises VRAM --
+# a new chat first calls /api/chat/title, which generates with a completely
+# different shape (a ~500 character prompt, 24 new tokens) and strands blocks
+# that the following full-transcript request cannot use.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import shutil
 import threading
 import time

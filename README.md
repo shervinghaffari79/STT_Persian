@@ -390,11 +390,21 @@ silence is a model load.
 block PyTorch cannot see. `GET /api/chat-status` reports
 `"quantization": "4bit"` when this is working.
 
-Worth setting on the server:
+**VRAM creep across chats.** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+is now set by `server.py` before anything imports torch (PyTorch reads it once,
+when it initialises its CUDA allocator, and ignores later changes — so an
+explicit value in your environment still wins, but you no longer have to set
+one).
 
-```powershell
-$env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-```
+Without it the caching allocator keeps fixed-size blocks, and a request whose
+tensors are a different *shape* cannot reuse them — it takes fresh segments and
+reserved memory ratchets up while allocated memory stays flat. That is why more
+questions in the **same** chat cost nothing (identical prompt shape every time,
+since history is not resent) while opening a **new** chat raises VRAM: a new
+chat first calls `/api/chat/title`, which generates with a very different shape
+(~500-character prompt, 24 new tokens) and strands blocks the following
+full-transcript request cannot use. Each generation now also returns its
+finished KV cache and activations to the driver.
 
 ### Chat model knobs
 

@@ -390,6 +390,35 @@ def _fit_to_context(tok, messages, transcript, max_new_tokens, max_ctx):
     return _build_messages(trimmed, t)
 
 
+def _release_cuda(where: str = ""):
+    """Return this generation's cached-but-unused blocks to the driver.
+
+    The chat model itself is not touched -- only the KV cache and activations
+    the finished request left behind. Without this, reserved VRAM tracks the
+    high-water mark of every SHAPE seen so far: a title generation (~500-char
+    prompt, 24 new tokens) and a full transcript answer allocate very
+    differently, so alternating between them ratchets reserved memory up even
+    while allocated memory is flat.
+
+    expandable_segments (set in server.py) largely prevents that, but it only
+    applies if PyTorch saw it before initializing CUDA -- and this also covers
+    the case where an OOM has just left the pool fragmented."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return
+        before = torch.cuda.memory_reserved()
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_reserved()
+        if before - after > 256 * 1024 * 1024:      # only worth a line if it mattered
+            print(f"[mem] released {(before - after) / 1e9:.2f} GB of cached VRAM"
+                  f"{' after ' + where if where else ''} "
+                  f"(reserved {before / 1e9:.2f} -> {after / 1e9:.2f} GB)",
+                  file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def _check_thinking_leak(tok, output_ids, prompt_len):
     """Confirm enable_thinking=False actually suppressed Qwen3.5's default
     <think>...</think> reasoning block -- and say so loudly if it didn't.
@@ -547,6 +576,12 @@ def _stream_tokens(messages, transcript="", max_tokens=None, temperature=0.7):
         raise RuntimeError(f"generation failed: {error[0]}")
     if raw_output:
         _check_thinking_leak(tok, raw_output[0], inputs["input_ids"].shape[-1])
+    # This request's KV cache and activations are dead now; hand the blocks back
+    # rather than letting reserved VRAM keep the high-water mark of every prompt
+    # shape seen so far.
+    del gen_kwargs, inputs
+    raw_output.clear()
+    _release_cuda("a chat reply")
 
 
 def make_title(transcript: str) -> str:
@@ -565,5 +600,10 @@ def make_title(transcript: str) -> str:
         inputs = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True, enable_thinking=False).to(model.device)
         out_ids = model.generate(**inputs, max_new_tokens=24, do_sample=True, temperature=0.5)
         out = tok.decode(out_ids[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
+        # A new chat calls this BEFORE its first real question, and its shape is
+        # nothing like a full-transcript answer's -- exactly the pair that
+        # strands blocks the next request cannot reuse.
+        del inputs, out_ids
+        _release_cuda("a title generation")
 
     return out.splitlines()[0].strip('"“”') if out else "تحلیل جدید"
