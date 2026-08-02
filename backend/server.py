@@ -162,11 +162,15 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
             pass
 
 
-# A job that stops making progress for this long is declared stuck. Generous,
-# because a legitimately quiet stretch exists: diarization on a long recording
-# runs for minutes with no per-chunk callback (37s for 14 minutes of audio, so
-# a 2h file is several minutes). 30 min is far past that.
-STALL_TIMEOUT_S = float(os.environ.get("JOB_STALL_TIMEOUT", "1800"))
+# A job that stops making progress for this long is declared stuck.
+#
+# This was 30 minutes, chosen when diarization was one silent block and a long
+# recording could legitimately go minutes without an update. It now reports
+# progress through that stage (pipeline._diarize_pyannote's hook), so the
+# longest legitimate silence is a model load, and 5 minutes is both safe and
+# actually useful -- 30 minutes is well past the point where someone gives up
+# and kills the server, which is what was happening.
+STALL_TIMEOUT_S = float(os.environ.get("JOB_STALL_TIMEOUT", "300"))
 
 
 def _watchdog():

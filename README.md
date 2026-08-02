@@ -352,6 +352,14 @@ during chat: Whisper 4.11 + chat 7.97 (fp16) = 12.08 / 14.83 GB -> 2.75 GB free
              (pyannote 1.10 released; reloads on the next transcription)
 ```
 
+The diarizer is **moved to CPU**, not dropped. Dropping it clears the cached
+pipeline, so the next transcription calls `Pipeline.from_pretrained()` again —
+and that contacts Hugging Face to resolve the repo even when the weights are
+cached locally. This deployment has been observed pulling from the Hub at
+~58 kB/s, which turns "upload a file after chatting" into a job that sits at 0%
+with nothing in the log. Relocating the tensors keeps the round trip local and
+instant.
+
 > ⚠️ **Whisper is never unloaded.** Releasing the CTranslate2 model — by
 > dropping the object *or* via its own `unload_model()` — repeatedly
 > destabilised this deployment, once as a native crash that killed the worker
@@ -368,7 +376,9 @@ chat or transcription — starts from a clean card. `CHAT_8BIT=1` halves the cha
 footprint if your transcripts routinely exceed the headroom.
 
 **Nothing gets stuck.** A watchdog fails any job that stops progressing for
-`JOB_STALL_TIMEOUT` seconds (default 1800). A wedged CUDA call after an OOM
+`JOB_STALL_TIMEOUT` seconds (default 300). Diarization reports progress through
+its own stage, so the longest legitimate silence is a model load — which is why
+this can be 5 minutes rather than the 30 it started at. A wedged CUDA call after an OOM
 never returns, so without this the job sits in `processing` forever and the UI
 spins for ~48 minutes with no explanation. The job is marked `error` with the
 stage it stalled at and a VRAM reading, so the client stops and shows a reason.
@@ -458,7 +468,7 @@ fp16 tensor-core support.
 |---|---|---|
 | `CHAT_8BIT` | `0` (off) | fp16 (faster). `1` = 8-bit, ~8 GB → ~5 GB, slower — use if long transcripts exhaust the ~2.75 GB headroom |
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
-| `JOB_STALL_TIMEOUT` | `1800` | Seconds without progress before a job is failed so the UI stops waiting |
+| `JOB_STALL_TIMEOUT` | `300` | Seconds without progress before a job is failed so the UI stops waiting |
 | `CHAT_STATELESS` | `1` (on) | Each question answered independently — prior turns are not sent. `0` keeps the full conversation |
 | `CHAT_MAX_TOKENS` | `350` | Hard ceiling on a reply. Backstop for the brevity instruction; raise it if answers are cut mid-sentence |
 | `CHAT_BACKEND` | `auto` | `mlx` \| `transformers` if auto-detection guesses wrong |

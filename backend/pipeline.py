@@ -136,6 +136,11 @@ _PYANNOTE_TRIED = False
 # weaker diarizer, with nothing in the log to say it happened. A lock makes a
 # concurrent caller WAIT for the in-flight load and then get the real model.
 _PYANNOTE_LOCK = threading.Lock()
+# Whether pyannote's tensors are currently on the GPU, and which device to send
+# them back to. free_diarizer() parks it on CPU between jobs; _diarize_pyannote()
+# restores it. Tracked rather than re-derived so a restore never guesses wrong.
+_PYANNOTE_ON_GPU = False
+_PYANNOTE_DEVICE = None
 _VAD_LOCK = threading.Lock()
 _VAD_MODEL = None
 
@@ -178,26 +183,39 @@ def _unload_pyannote():
 
 
 def free_diarizer() -> bool:
-    """Drop the diarization pipeline to make room for the chat model.
-    Returns True if something was actually released.
+    """Move the diarization pipeline to CPU to free its VRAM for the chat model.
+    Returns True if anything was moved.
+
+    Moved, NOT dropped. Dropping it would clear the cached pipeline, so the next
+    transcription would call Pipeline.from_pretrained() again -- and that goes
+    back to Hugging Face to resolve the repo even when the weights are cached.
+    On this deployment the Hub has been observed at ~58 kB/s, so that turns
+    "upload a file after chatting" into a job that sits at 0% for a long time
+    with nothing in the log, which is exactly the reported hang. Keeping the
+    object and only relocating its tensors makes the round trip local and
+    instant.
 
     ONLY pyannote. Whisper is deliberately never touched from here: releasing
     the CTranslate2 model -- whether by dropping the object or via its own
-    unload_model() -- repeatedly destabilised this deployment, once as a native
-    crash with no Python traceback at all. pyannote is pure PyTorch, so freeing
-    it is thread-safe, has no native teardown, and is reversible: the next
-    transcription reloads it through the normal lazy path.
+    unload_model() -- destabilised this deployment twice, once as a native
+    crash with no Python traceback at all. pyannote is pure PyTorch, so moving
+    it is thread-safe and has no native teardown.
 
-    Diarization is finished long before anyone opens the chat panel, so this
-    costs nothing for the current job and only a reload on the next one."""
-    global _PYANNOTE, _PYANNOTE_TRIED
-    if _PYANNOTE is None:
+    _diarize_pyannote() moves it back before it runs."""
+    global _PYANNOTE_ON_GPU
+    if _PYANNOTE is None or not _PYANNOTE_ON_GPU:
         return False
     with _PYANNOTE_LOCK:
-        if _PYANNOTE is None:
+        if _PYANNOTE is None or not _PYANNOTE_ON_GPU:
             return False
-        _PYANNOTE = None
-        _PYANNOTE_TRIED = False   # allow the reload
+        try:
+            import torch
+            _PYANNOTE.to(torch.device("cpu"))
+            _PYANNOTE_ON_GPU = False
+        except Exception as e:
+            print(f"[mem] could not move the diarizer to CPU: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+            return False
     import gc
     gc.collect()
     _free_gpu()
@@ -500,7 +518,7 @@ def _load_pyannote():
 
 
 def _load_pyannote_locked():
-    global _PYANNOTE, _PYANNOTE_ID, _PYANNOTE_TRIED
+    global _PYANNOTE, _PYANNOTE_ID, _PYANNOTE_TRIED, _PYANNOTE_ON_GPU, _PYANNOTE_DEVICE
     try:
         # speechbrain 1.1 lazily imports optional integrations (k2/nlp/numba) that
         # aren't buildable on macOS; make those failures non-fatal.
@@ -587,6 +605,8 @@ def _load_pyannote_locked():
             gpu_device = torch.device("mps")
         else:
             gpu_device = None
+        _PYANNOTE_DEVICE = gpu_device
+        _PYANNOTE_ON_GPU = gpu_device is not None
         if gpu_device is not None:
             try:
                 pipe.to(gpu_device)
@@ -665,9 +685,25 @@ def _turns_from(ann):
     return [(turn.start, turn.end, spk) for turn, spk in ann]
 
 
-def _diarize_pyannote(audio):
+def _restore_diarizer():
+    """Put pyannote back on the GPU if free_diarizer() parked it on CPU."""
+    global _PYANNOTE_ON_GPU
+    if _PYANNOTE is None or _PYANNOTE_ON_GPU or _PYANNOTE_DEVICE is None:
+        return
+    with _PYANNOTE_LOCK:
+        if _PYANNOTE is None or _PYANNOTE_ON_GPU or _PYANNOTE_DEVICE is None:
+            return
+        t0 = time.time()
+        _PYANNOTE.to(_PYANNOTE_DEVICE)
+        _PYANNOTE_ON_GPU = True
+        print(f"[mem] diarizer restored to {_PYANNOTE_DEVICE} in "
+              f"{time.time() - t0:.1f}s", file=sys.stderr, flush=True)
+
+
+def _diarize_pyannote(audio, progress=None):
     import torch
     pipe = _load_pyannote()
+    _restore_diarizer()
     if pipe is None:
         return None
 
@@ -689,8 +725,25 @@ def _diarize_pyannote(audio):
          f"{len(audio)/SAMPLE_RATE:.1f}s of audio{' ' + str(kwargs) if kwargs else ''}…",
          file=sys.stderr, flush=True)
     t0 = time.time()
-    dia = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE},
-               **kwargs)
+    # Report progress THROUGH diarization. Without this the whole stage is one
+    # silent block -- minutes on a long recording -- so "slow" and "wedged" look
+    # identical to the user and to the stall watchdog, which then cannot use a
+    # timeout short enough to be useful. pyannote calls this hook per internal
+    # step with completed/total counts.
+    hook = None
+    if progress is not None:
+        def hook(step_name, step_artifact=None, file=None, total=None, completed=None):
+            if total and completed is not None:
+                progress(f"Identifying speakers… {step_name} {int(100 * completed / total)}%")
+            else:
+                progress(f"Identifying speakers… {step_name}")
+
+    payload = {"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE}
+    try:
+        dia = pipe(payload, hook=hook, **kwargs) if hook else pipe(payload, **kwargs)
+    except TypeError:
+        # this pyannote build does not accept hook= -- lose the progress, keep the job
+        dia = pipe(payload, **kwargs)
     print(f"[diarize] inference finished in {time.time() - t0:.1f}s",
           file=sys.stderr, flush=True)
 
@@ -1010,7 +1063,7 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
         _log("Identifying speakers…", progress)
         if DIARIZER == "pyannote":
             try:
-                turns = _diarize_pyannote(audio)
+                turns = _diarize_pyannote(audio, progress=progress)
                 if turns is not None:
                     diarizer_used = "pyannote"
             except Exception as e:
