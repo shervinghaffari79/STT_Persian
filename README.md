@@ -371,8 +371,19 @@ hardware. bitsandbytes 4-bit needs sm_75+, which the T4 satisfies exactly.
 > `chat.py` logs it, and the symptom is an OOM later rather than an install
 > error. It is in `requirements.txt`.
 
-The one remaining unload: the chat model is dropped before each transcription
-and reloads lazily on the next chat request.
+**Nothing is unloaded at all any more.** All three models stay resident for the
+process lifetime, including through a transcription:
+
+```
+Whisper 4.09 + pyannote 1.10 + chat 2.80 (4-bit) = 7.99 / 14.83 GB -> 6.84 GB free
+```
+
+The chat model used to be dropped before every job, which was correct at fp16
+(the same three came to 13.16 GB, leaving 1.67 GB for diarization activations)
+but at 4-bit only costs a ~10s reload on the first chat message afterwards.
+`UNLOAD_CHAT_FOR_TRANSCRIBE=1` restores it — worth doing if you go back to
+fp16/8-bit weights, or if a very long recording pushes diarization (batch 32,
+activations scale with duration) into the remaining headroom.
 
 > ⚠️ **Recovering from an OOM must happen outside the `except` block.** While a
 > handler runs, Python holds the exception as the *current* exception; its
@@ -425,6 +436,7 @@ fp16 tensor-core support.
 | `CHAT_4BIT` | `1` (on) | NF4 4-bit, ~8 GB → ~2.8 GB, so Whisper + diarizer + chat all stay on the GPU. `0` falls through to `CHAT_8BIT`/fp16 |
 | `CHAT_8BIT` | `0` (off) | 8-bit — only used when `CHAT_4BIT=0`. Slower than fp16 at this model size |
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
+| `UNLOAD_CHAT_FOR_TRANSCRIBE` | `0` (off) | `1` drops the chat model before each transcription (only needed at fp16/8-bit) |
 | `JOB_STALL_TIMEOUT` | `300` | Seconds without progress before a job is failed so the UI stops waiting |
 | `DECODE_TIMEOUT` | `600` | Seconds ffmpeg may take before the decode is abandoned as a malformed container |
 | `ASR_SLOW_CHUNK_WARN` | `20` | Seconds after which a single ASR chunk is logged as slow, with its audio timestamps |

@@ -87,6 +87,11 @@ def _job_delta(n: int) -> int:
 # during chat anyway -- worth it only if you go back to fp16/8-bit weights.
 FREE_DIARIZER_FOR_CHAT = os.environ.get("CHAT_FREE_DIARIZER", "0") != "0"
 
+# Also off by default, and for the same reason: at 4-bit all three models fit
+# with ~6.8 GB to spare, so dropping the chat model before a job only costs a
+# reload on the next chat message. See _run_job().
+UNLOAD_CHAT_FOR_TRANSCRIBE = os.environ.get("UNLOAD_CHAT_FOR_TRANSCRIBE", "0") != "0"
+
 
 def _free_diarizer_for_chat():
     """Release pyannote before generating a chat reply. Disabled by default.
@@ -164,13 +169,18 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
         # register the live list itself; on_segment appends to it in place
         _set(job_id, state="processing", progress=2, message="Starting…",
              partial=partial, speakers=[])
-        # The chat LLM is cached for the process lifetime once the AI Analysis
-        # panel has been used. Dropping it before a transcription is the ONE
-        # unload this backend still does, and it predates the chat-side
-        # swapping that was removed: it is cheap, it has never misbehaved, and
-        # it keeps a long file from competing with the chat model. The next
-        # /api/chat request reloads it lazily.
-        if chat.unload():
+        # The chat model is left LOADED through transcription. It used to be
+        # dropped here, which was correct when it was fp16: Whisper 4.09 +
+        # pyannote 1.10 + chat 7.97 = 13.16 of 14.83 GB left only 1.67 GB for
+        # diarization activations. At 4-bit the same three total ~8.0 GB and
+        # leave ~6.8 GB, so the unload buys nothing and costs a ~10s reload on
+        # the first chat message after every job.
+        #
+        # UNLOAD_CHAT_FOR_TRANSCRIBE=1 restores it -- worth doing if you go back
+        # to fp16/8-bit weights, or if a very long recording pushes diarization
+        # (batch 32, activations scale with file length) into the remaining
+        # headroom.
+        if UNLOAD_CHAT_FOR_TRANSCRIBE and chat.unload():
             print("[mem] unloaded chat model to free GPU for transcription", flush=True)
         result = pipeline.transcribe(tmp_path, diarize=diarize, progress=progress,
                                      on_segment=on_segment, correct_fn=correct_fn)
