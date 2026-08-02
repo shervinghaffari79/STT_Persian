@@ -64,8 +64,15 @@ def _job_delta(n: int) -> int:
         return _ACTIVE_JOBS
 
 
+# Off by default: with the chat model at 4-bit, Whisper (4.09) + pyannote (1.10)
+# + chat (~2.8) all fit resident with ~6.8 GB of a 14.83 GB card still free, so
+# nothing needs to move. Set CHAT_FREE_DIARIZER=1 to park the diarizer on CPU
+# during chat anyway -- worth it only if you go back to fp16/8-bit weights.
+FREE_DIARIZER_FOR_CHAT = os.environ.get("CHAT_FREE_DIARIZER", "0") != "0"
+
+
 def _free_diarizer_for_chat():
-    """Release pyannote before generating a chat reply.
+    """Release pyannote before generating a chat reply. Disabled by default.
 
     Best-effort by construction: this is a memory optimization, so a failure
     here must degrade to "chat runs with less VRAM", never to a failed request.
@@ -73,6 +80,8 @@ def _free_diarizer_for_chat():
     would become a bare 500 whose cause lives only in the console.
 
     Only the diarizer. Whisper stays resident -- see pipeline.free_diarizer()."""
+    if not FREE_DIARIZER_FOR_CHAT:
+        return
     try:
         with _ACTIVE_LOCK:
             busy = _ACTIVE_JOBS

@@ -344,142 +344,57 @@ check for it before trading accuracy for speed.
 
 ### GPU memory: who holds what
 
-The chat LLM runs **unquantized (fp16)**. Room is made by unloading the
-**diarizer only** before a chat reply:
+**Everything stays resident on the GPU.** Nothing is unloaded or moved for
+chat — the room comes from running the chat model in **4-bit (NF4)** instead:
 
 ```
-during chat: Whisper 4.11 + chat 7.97 (fp16) = 12.08 / 14.83 GB -> 2.75 GB free
-             (pyannote 1.10 released; reloads on the next transcription)
+fp16   Whisper 4.09 + pyannote 1.10 + chat 7.97 = 13.16 / 14.83 GB -> 1.67 GB free  OOMs
+4-bit  Whisper 4.09 + pyannote 1.10 + chat ~2.8 =  ~8.0 / 14.83 GB -> ~6.8 GB free  OK
 ```
 
-The diarizer is **moved to CPU**, not dropped. Dropping it clears the cached
-pipeline, so the next transcription calls `Pipeline.from_pretrained()` again —
-and that contacts Hugging Face to resolve the repo even when the weights are
-cached locally. This deployment has been observed pulling from the Hub at
-~58 kB/s, which turns "upload a file after chatting" into a job that sits at 0%
-with nothing in the log. Relocating the tensors keeps the round trip local and
-instant.
+**4-bit is not the same trade as 8-bit.** `LLM.int8()` adds a mixed-precision
+decomposition for outlier channels and is genuinely *slower* than fp16 at this
+model size, which is why 8-bit was never made the default. NF4 dequantizes to
+the compute dtype with no outlier path, and single-stream decoding on a T4 is
+bandwidth-bound rather than compute-bound — a quarter of the weight traffic
+usually more than pays for the dequantization.
 
-> ⚠️ **Whisper is never unloaded.** Releasing the CTranslate2 model — by
-> dropping the object *or* via its own `unload_model()` — repeatedly
-> destabilised this deployment, once as a native crash that killed the worker
-> with no Python traceback at all. pyannote is pure PyTorch: freeing it is
-> thread-safe, has no native teardown, and is reversible through the normal
-> lazy load. The diarizer is also finished long before anyone opens the chat
-> panel, so releasing it costs nothing for the current job.
+The honest cost is **accuracy**, not speed: 4-bit is the lossiest of the three,
+and this is a Persian summarization/QA task where that can show up as weaker
+recall of specific details. If answers degrade noticeably, `CHAT_4BIT=0`
+`CHAT_8BIT=1` is the middle option.
 
-That leaves ~2.75 GB for KV cache and activations — enough for normal replies,
-but a long transcript can still exceed it. **The OOM path is therefore built to
-be survivable rather than prevented:** the chat model is dropped *outside* the
-exception handler (see below), the allocator is emptied, and the next request —
-chat or transcription — starts from a clean card. `CHAT_8BIT=1` halves the chat
-footprint if your transcripts routinely exceed the headroom.
+Compute dtype is fp16, not bf16: the T4 is Turing (sm_75) with no bf16
+hardware. bitsandbytes 4-bit needs sm_75+, which the T4 satisfies exactly.
 
-**Nothing gets stuck.** A watchdog fails any job that stops progressing for
-`JOB_STALL_TIMEOUT` seconds (default 300). Both long stages — ffmpeg decoding
-and diarization — report progress as they run (`Decoding audio… 4.2 min
-decoded`, `Identifying speakers… segmentation 25%`), so the longest legitimate
-silence is a model load. That is what makes a 5-minute timeout safe; it started
-at 30 because those stages were silent and a slow one was indistinguishable
-from a wedged one. A wedged CUDA call after an OOM
-never returns, so without this the job sits in `processing` forever and the UI
-spins for ~48 minutes with no explanation. The job is marked `error` with the
-stage it stalled at and a VRAM reading, so the client stops and shows a reason.
-It cannot unwedge the worker thread — only a restart does that — but it frees
-the user.
+> `bitsandbytes` must be installed or the quantized load falls back to fp16 —
+> `chat.py` logs it, and the symptom is an OOM later rather than an install
+> error. It is in `requirements.txt`.
+
+The one remaining unload: the chat model is dropped before each transcription
+and reloads lazily on the next chat request.
 
 > ⚠️ **Recovering from an OOM must happen outside the `except` block.** While a
 > handler runs, Python holds the exception as the *current* exception; its
 > traceback keeps the generating frame alive, and that frame holds the model. An
 > `unload()` called inside the handler clears the module global and frees
-> nothing — observed as 7.97 GB still allocated on the `gpu_report` printed
-> immediately after `"unloaded chat model"`. Clearing `e.__traceback__` is *not*
-> sufficient; only leaving the handler releases it.
+> nothing. Clearing `e.__traceback__` is *not* sufficient; only leaving the
+> handler releases it.
 
-`GET /api/gpu-status` shows the live split. `non_torch_gib` is the CTranslate2
-block — it allocates outside PyTorch's allocator, so it never appears in a torch
-OOM message and `torch.cuda.empty_cache()` cannot reclaim it, which is why the
-numbers in such an error never add up to the card.
+**Nothing gets stuck.** A watchdog fails any job that stops progressing for
+`JOB_STALL_TIMEOUT` seconds (default 300). Both long stages — ffmpeg decoding
+and diarization — report progress as they run, so the longest legitimate
+silence is a model load.
 
-Worth setting on the server, as the OOM message itself suggests:
+`GET /api/gpu-status` shows the live split; `non_torch_gib` is the CTranslate2
+block PyTorch cannot see. `GET /api/chat-status` reports
+`"quantization": "4bit"` when this is working.
+
+Worth setting on the server:
 
 ```powershell
 $env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ```
-
-### Stateless chat turns
-
-Each question is answered **independently**: only the newest user turn is sent,
-never the conversation so far. The transcript is re-embedded in the system
-prompt on every request, so history is pure additive growth on top of an
-already-large constant — left unbounded, a handful of follow-ups on a long
-recording walks the prompt into the KV-cache headroom left after Whisper and
-the chat weights. That is why the earlier OOM appeared on the *second* message
-rather than the first.
-
-| turn | with history | stateless |
-|---|---|---|
-| 1 | 5,400 tok · 0.18 GB | 5,200 tok · 0.17 GB |
-| 10 | 9,000 tok · 0.29 GB | 5,200 tok · 0.17 GB |
-| 40 | 21,000 tok · 0.69 GB | 5,200 tok · 0.17 GB |
-
-**The cost is real:** the model cannot resolve a follow-up that refers back —
-"توضیح بیشتر بده", "why?", "and the second one?" — because it never sees what
-came before. Every question has to stand on its own. The full transcript is
-still available to it, so questions *about the recording* work exactly as
-before; only references to earlier chat turns break. `CHAT_STATELESS=0`
-restores the full conversation.
-
-### Short answers, intact citations
-
-The system prompt asks for **at most 3 short sentences** (or 4 bullets for a
-genuine list) with no preamble, no restatement of the question and no closing
-summary — explicitly including "summarize"/"what was discussed", which are the
-prompts that otherwise produce a page of text. `CHAT_MAX_TOKENS` (default 350)
-is the hard backstop for when the model ignores that.
-
-Clickable references are unaffected. `Markdown.tsx` matches
-`[S1 04:12]`-style citations with a regex that **requires the closing bracket**,
-so a reply truncated at the ceiling mid-bracket would both lose the link and
-print the raw fragment (`[S1 04:`) into the answer. Two things prevent that:
-
-- the prompt tells the model to always finish a bracket it starts and to place
-  citations mid-sentence rather than as the last thing it writes;
-- `_guard_partial_citations()` withholds text from the last unclosed `[` and
-  releases it the moment `]` arrives. Anything still unclosed when the stream
-  ends is dropped, since it never became a usable citation.
-
-Only a ~14-character tail is ever held, and a `[` that clearly isn't a citation
-(`[نامفهوم]`, long bracketed text) is released immediately, so streaming feels
-unchanged. Complete citations pass through byte-for-byte.
-
-### Giving the LLM the whole card (CPU-only ASR)
-
-If chat still OOMs, the remaining lever is to keep **Whisper and the diarizer
-off the GPU entirely** so the chat model has all of it:
-
-```powershell
-$env:ASR_DEVICE="cpu"        # Whisper on CPU  (frees ~4.1 GB)
-$env:PYANNOTE_DEVICE="cpu"   # diarizer on CPU (frees ~1.1 GB)
-```
-
-```
-default : Whisper 4.09 + chat 7.97 = 12.06 / 14.83 GB -> 2.77 GB headroom
-CPU ASR : chat 7.97 alone          =  7.97 / 14.83 GB -> 6.86 GB headroom  (2.5x)
-```
-
-**The trade is real and it is not small.** CTranslate2 int8 on CPU runs at
-roughly real-time, versus several times faster than real-time on the T4 — a
-15-minute recording goes from a couple of minutes to something closer to its
-own length, and pyannote on CPU is slower again. Transcription is the product's
-main job, so this is worth doing only if the chat panel matters more than
-turnaround, or if the machine has cores to spare.
-
-Before reaching for it, check the `[chat] prompt N tokens (~X GB KV cache)`
-line the backend now logs before every generation. It separates "the chat model
-does not fit" from "this particular transcript is too long", which have
-different fixes — a large prompt is better solved with `CHAT_8BIT=1` or a
-shorter transcript than by moving ASR to CPU.
 
 ### Chat model knobs
 
@@ -497,7 +412,8 @@ fp16 tensor-core support.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `CHAT_8BIT` | `0` (off) | fp16 (faster). `1` = 8-bit, ~8 GB → ~5 GB, slower — use if long transcripts exhaust the ~2.75 GB headroom |
+| `CHAT_4BIT` | `1` (on) | NF4 4-bit, ~8 GB → ~2.8 GB, so Whisper + diarizer + chat all stay on the GPU. `0` falls through to `CHAT_8BIT`/fp16 |
+| `CHAT_8BIT` | `0` (off) | 8-bit — only used when `CHAT_4BIT=0`. Slower than fp16 at this model size |
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
 | `JOB_STALL_TIMEOUT` | `300` | Seconds without progress before a job is failed so the UI stops waiting |
 | `DECODE_TIMEOUT` | `600` | Seconds ffmpeg may take before the decode is abandoned as a malformed container |

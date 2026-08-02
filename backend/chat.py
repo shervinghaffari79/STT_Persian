@@ -159,45 +159,63 @@ def _ensure():
         dtype = torch.float16 if device == "cuda" else torch.float32
         _TOK = AutoTokenizer.from_pretrained(HF_MODEL)
 
-        # Quantization is OFF by default: the model runs at full fp16 on CUDA,
-        # which is the faster path. Room is made by unloading the DIARIZER
-        # before a chat reply (server.py) -- Whisper is never touched, because
-        # tearing down the CTranslate2 model crashed this deployment outright.
+        # 4-bit (NF4) by default on CUDA. This is what lets Whisper AND the
+        # diarizer stay resident on the GPU alongside the chat model instead of
+        # anything being swapped or moved to CPU:
         #
-        # That leaves roughly 2.7 GB for KV cache and activations, which is
-        # enough for normal replies but can be exceeded on a long transcript.
-        # The OOM path is therefore built to be survivable rather than
-        # prevented: the model is dropped, the allocator is emptied, and the
-        # next request -- chat or transcription -- starts from a clean card.
-        # CHAT_8BIT=1 halves the footprint (~8 GB -> ~5 GB) at a real cost in
-        # tokens/sec if that headroom is not enough for your transcripts.
+        #   fp16   Whisper 4.09 + pyannote 1.10 + chat 7.97 = 13.16 -> 1.67 GB free
+        #   4-bit  Whisper 4.09 + pyannote 1.10 + chat ~2.8 =  ~8.0 -> ~6.8 GB free
         #
-        # LLM.int8() is a footprint optimization, not a speed one: it
-        # dequantizes on the fly and runs a mixed-precision path for outlier
-        # channels, and only pays off above a hidden-dimension crossover that
-        # Qwen3.5-4B (hidden size 2560) sits below -- so it is SLOWER than fp16
-        # here, which is why it is not the default.
+        # NF4 is not the same trade as LLM.int8(). int8 adds a mixed-precision
+        # decomposition for outlier channels and is genuinely slower than fp16
+        # at this model size, which is why 8-bit was never made the default.
+        # 4-bit dequantizes to the compute dtype with no outlier path, and
+        # single-stream decoding on a T4 is bandwidth-bound rather than
+        # compute-bound -- a quarter of the weight traffic usually more than
+        # pays for the dequantization.
+        #
+        # The honest cost is ACCURACY, not speed: 4-bit is the lossiest of the
+        # three, and this is a Persian summarization/QA task where that can show
+        # as weaker recall of specific details. CHAT_4BIT=0 falls back to
+        # CHAT_8BIT, and both off gives plain fp16.
+        #
+        # compute dtype is float16, not bfloat16: the T4 is Turing (sm_75) and
+        # has no bf16 hardware. bitsandbytes 4-bit itself requires sm_75+, which
+        # the T4 satisfies exactly.
         #
         # Quantized loads must NOT be followed by .to(device): bitsandbytes
         # places the weights itself through accelerate, and moving the module
         # afterwards raises. Hence the separate device_map path below.
-        quant_cfg = None
-        if device == "cuda" and os.environ.get("CHAT_8BIT", "0") != "0":
+        quant_cfg, quant_name = None, None
+        want_4bit = os.environ.get("CHAT_4BIT", "1") != "0"
+        want_8bit = os.environ.get("CHAT_8BIT", "0") != "0"
+        if device == "cuda" and (want_4bit or want_8bit):
             try:
                 import bitsandbytes  # noqa: F401 -- availability probe only
                 from transformers import BitsAndBytesConfig
-                quant_cfg = BitsAndBytesConfig(load_in_8bit=True)
+                if want_4bit:
+                    quant_cfg = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True)
+                    quant_name = "4bit"
+                else:
+                    quant_cfg = BitsAndBytesConfig(load_in_8bit=True)
+                    quant_name = "8bit"
             except Exception as e:
-                print(f"[chat] 8-bit requested but unavailable ({type(e).__name__}: {e}) -- "
-                      "falling back to fp16. Install bitsandbytes to halve the "
-                      "chat model's VRAM.", file=sys.stderr, flush=True)
+                print(f"[chat] {'4-bit' if want_4bit else '8-bit'} requested but "
+                      f"unavailable ({type(e).__name__}: {e}) -- falling back to fp16, "
+                      "which needs ~8GB and may not leave room for Whisper + the "
+                      "diarizer. Install bitsandbytes.", file=sys.stderr, flush=True)
 
         if quant_cfg is not None:
             _MODEL = AutoModelForCausalLM.from_pretrained(
                 HF_MODEL, quantization_config=quant_cfg, device_map={"": 0})
-            print(f"[chat] {HF_MODEL} loaded in 8-bit on cuda", file=sys.stderr, flush=True)
+            print(f"[chat] {HF_MODEL} loaded in {quant_name} on cuda",
+                  file=sys.stderr, flush=True)
             _device_info.update(backend="transformers", model=HF_MODEL, device="cuda",
-                                quantization="8bit")
+                                quantization=quant_name)
         else:
             _MODEL = AutoModelForCausalLM.from_pretrained(
                 HF_MODEL, torch_dtype=dtype).to(device)
