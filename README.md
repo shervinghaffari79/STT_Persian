@@ -376,9 +376,12 @@ chat or transcription — starts from a clean card. `CHAT_8BIT=1` halves the cha
 footprint if your transcripts routinely exceed the headroom.
 
 **Nothing gets stuck.** A watchdog fails any job that stops progressing for
-`JOB_STALL_TIMEOUT` seconds (default 300). Diarization reports progress through
-its own stage, so the longest legitimate silence is a model load — which is why
-this can be 5 minutes rather than the 30 it started at. A wedged CUDA call after an OOM
+`JOB_STALL_TIMEOUT` seconds (default 300). Both long stages — ffmpeg decoding
+and diarization — report progress as they run (`Decoding audio… 4.2 min
+decoded`, `Identifying speakers… segmentation 25%`), so the longest legitimate
+silence is a model load. That is what makes a 5-minute timeout safe; it started
+at 30 because those stages were silent and a slow one was indistinguishable
+from a wedged one. A wedged CUDA call after an OOM
 never returns, so without this the job sits in `processing` forever and the UI
 spins for ~48 minutes with no explanation. The job is marked `error` with the
 stage it stalled at and a VRAM reading, so the client stops and shows a reason.
@@ -469,6 +472,7 @@ fp16 tensor-core support.
 | `CHAT_8BIT` | `0` (off) | fp16 (faster). `1` = 8-bit, ~8 GB → ~5 GB, slower — use if long transcripts exhaust the ~2.75 GB headroom |
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
 | `JOB_STALL_TIMEOUT` | `300` | Seconds without progress before a job is failed so the UI stops waiting |
+| `DECODE_TIMEOUT` | `600` | Seconds ffmpeg may take before the decode is abandoned as a malformed container |
 | `CHAT_STATELESS` | `1` (on) | Each question answered independently — prior turns are not sent. `0` keeps the full conversation |
 | `CHAT_MAX_TOKENS` | `350` | Hard ceiling on a reply. Backstop for the brevity instruction; raise it if answers are cut mid-sentence |
 | `CHAT_BACKEND` | `auto` | `mlx` \| `transformers` if auto-detection guesses wrong |

@@ -250,28 +250,99 @@ def gpu_report() -> dict:
     return out
 
 
-def decode_audio(path: str) -> np.ndarray:
-    """Any audio/video container -> 16 kHz mono float32 via ffmpeg."""
+DECODE_TIMEOUT_S = float(os.environ.get("DECODE_TIMEOUT", "600"))
+
+# ffmpeg prints a long version/configuration banner before anything useful, so
+# tailing its stderr surfaces "libswscale 9. 5.101" as the error while the real
+# line ("Invalid data found when processing input") scrolls past the cut.
+_FFMPEG_ERR_HINTS = ("error", "invalid", "could not", "no such", "denied",
+                     "unsupported", "corrupt", "truncated", "moov atom",
+                     "does not contain")
+
+
+def _ffmpeg_error(stderr: bytes, limit: int = 300) -> str:
+    """The informative part of ffmpeg's stderr, banner stripped."""
+    text = stderr.decode("utf-8", "ignore")
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    hits = [l for l in lines if any(h in l.lower() for h in _FFMPEG_ERR_HINTS)]
+    return " | ".join(hits)[-limit:] if hits else text[-limit:]
+
+
+def decode_audio(path: str, progress=None) -> np.ndarray:
+    """Any audio/video container -> 16 kHz mono float32 via ffmpeg.
+
+    Streams ffmpeg's output rather than waiting on subprocess.run(), so the
+    stage reports how much audio it has decoded as it goes. It used to be a
+    single "Decoding audio…" message followed by total silence until ffmpeg
+    finished, which made a slow decode and a wedged one look identical -- and,
+    once the stall watchdog was tightened to 5 minutes, meant a legitimately
+    long decode could be killed as a hang because nothing was refreshing the
+    job's heartbeat.
+
+    stderr is drained on its own thread: ffmpeg writes progress there
+    continuously, and leaving it in a pipe nobody reads eventually fills the
+    OS buffer and deadlocks the process -- the exact hang this is meant to
+    report on."""
     cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", str(path),
            "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-"]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err_parts: list = []
+    drain = threading.Thread(target=lambda: err_parts.append(proc.stderr.read()), daemon=True)
+    drain.start()
+
+    # A malformed header can make ffmpeg hang instead of exiting non-zero (an
+    # unfinalized RIFF size, an odd chunk layout -- seen on interrupted
+    # recordings). read() would block forever, so the deadline is enforced by
+    # killing the process rather than by a read timeout.
+    killed = threading.Event()
+
+    def _kill():
+        killed.set()
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    timer = threading.Timer(DECODE_TIMEOUT_S, _kill)
+    timer.start()
+
+    chunks, total, t0, last = [], 0, time.time(), 0.0
     try:
-        # No timeout here previously: a file whose header confuses ffmpeg's
-        # probing (seen with some WAV variants -- an unfinalized RIFF size, an
-        # unusual bit depth/chunk layout) can make it hang rather than exit
-        # non-zero. subprocess.run then blocks forever, the job never reaches
-        # state="error", and the only thing the user sees is the "Processing"
-        # spinner -- indistinguishable from a slow file except that it never
-        # finishes. 10 minutes is generous for decoding alone (no model
-        # inference happens here, this is just a format conversion).
-        proc = subprocess.run(cmd, capture_output=True, timeout=600)
-    except subprocess.TimeoutExpired:
+        while True:
+            buf = proc.stdout.read(1 << 20)
+            if not buf:
+                break
+            chunks.append(buf)
+            total += len(buf)
+            now = time.time()
+            if progress is not None and now - last > 2.0:
+                last = now
+                # 2 bytes per sample, mono
+                secs = total / (2 * SAMPLE_RATE)
+                progress(f"Decoding audio… {secs / 60:.1f} min decoded")
+        proc.stdout.close()
+        proc.wait()
+    finally:
+        timer.cancel()
+    drain.join(timeout=5)
+    stderr_bytes = err_parts[0] if err_parts else b""
+
+    if killed.is_set():
         raise RuntimeError(
-            "ffmpeg did not finish decoding this file within 10 minutes. The file's "
-            "container is likely malformed (e.g. an incomplete/streamed recording) "
-            "rather than genuinely large -- decoding itself is fast relative to "
-            "transcription. Try re-exporting or re-recording the file.")
+            f"ffmpeg did not finish decoding this file within "
+            f"{DECODE_TIMEOUT_S / 60:.0f} minutes (it had produced "
+            f"{total / (2 * SAMPLE_RATE) / 60:.1f} minutes of audio). The container is "
+            "likely malformed -- e.g. an incomplete or still-streaming recording -- "
+            "rather than genuinely large; decoding is fast relative to transcription. "
+            "Try re-exporting the file, or raise DECODE_TIMEOUT.")
+
+    out = b"".join(chunks)
+    print(f"[decode] {total / (2 * SAMPLE_RATE):.1f}s of audio in "
+          f"{time.time() - t0:.1f}s", file=sys.stderr, flush=True)
+
+    proc = types.SimpleNamespace(returncode=proc.returncode, stdout=out, stderr=stderr_bytes)
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', 'ignore')[-300:]}")
+        raise RuntimeError(f"ffmpeg failed: {_ffmpeg_error(proc.stderr)}")
     if len(proc.stdout) == 0:
         # ffmpeg can exit 0 while decoding zero frames -- e.g. a container with a
         # truncated/corrupted sample-index atom (seen with some phone recordings
@@ -282,7 +353,7 @@ def decode_audio(path: str) -> np.ndarray:
         if "truncated" in stderr.lower() or "moov atom not found" in stderr.lower():
             hint = " The file's internal index looks corrupted/incomplete (interrupted recording or transfer)."
         raise RuntimeError(f"No audio could be decoded from this file.{hint} ffmpeg said: "
-                          f"{stderr[-300:]}")
+                          f"{_ffmpeg_error(proc.stderr)}")
     return np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
 
 
@@ -1041,7 +1112,7 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
     nz = _normalizer()
 
     _log("Decoding audio…", progress)
-    audio = decode_audio(path)
+    audio = decode_audio(path, progress=progress)
     duration = len(audio) / SAMPLE_RATE
 
     _log("Detecting speech (VAD)…", progress)
