@@ -89,6 +89,11 @@ SPEAKER_AWARE_CHUNKS = os.environ.get("ASR_SPEAKER_CHUNKS", "1") != "0"
 # noise or nothing.
 MIN_CHUNK_S = float(os.environ.get("ASR_MIN_CHUNK_S", "0.5"))
 
+# A chunk is at most ~24s of audio and normally decodes in a couple of seconds.
+# Past this, log it: it is the signature of Whisper working through the
+# temperature-fallback ladder on audio it cannot settle on.
+SLOW_CHUNK_S = float(os.environ.get("ASR_SLOW_CHUNK_WARN", "20"))
+
 
 def model_dir() -> Path:
     """Best-guess directory of the ASR model that will be used -- mirrors
@@ -812,8 +817,16 @@ def _diarize_pyannote(audio, progress=None):
     payload = {"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE}
     try:
         dia = pipe(payload, hook=hook, **kwargs) if hook else pipe(payload, **kwargs)
-    except TypeError:
-        # this pyannote build does not accept hook= -- lose the progress, keep the job
+    except TypeError as e:
+        # This build does not accept hook=. Say so: the fallback used to be
+        # silent, which made diarization look like it was reporting progress
+        # when it was in fact a wholly silent block -- and a silent block is
+        # exactly what the stall watchdog cannot distinguish from a hang.
+        print(f"[diarize] this pyannote build rejected the progress hook "
+              f"({e}) -- running without progress reporting. Diarization will "
+              f"be silent for its whole duration; if it outlasts "
+              f"JOB_STALL_TIMEOUT the watchdog will treat it as stuck.",
+              file=sys.stderr, flush=True)
         dia = pipe(payload, **kwargs)
     print(f"[diarize] inference finished in {time.time() - t0:.1f}s",
           file=sys.stderr, flush=True)
@@ -1204,6 +1217,7 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
     # absorb a short standalone segment into its neighbour even when that
     # neighbour came from a different transcribe_chunk() call entirely
     carry_label, carry_count = None, 0
+    chunk_times: list = []
     n = len(chunks)
     for i, (a, b, chunk_spk) in enumerate(chunks):
         _log(f"Transcribing {i+1}/{n}…", progress)
@@ -1212,10 +1226,29 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
         # Word timestamps cost an extra alignment pass, so only pay for them
         # when diarization can actually use them to split a segment -- which a
         # speaker-aligned chunk never needs, since its speaker is already known.
+        # Time every chunk and report the slow ones. A chunk is <=24s of audio
+        # and normally decodes in a couple of seconds, so anything far above
+        # that is the interesting case: Whisper re-decoding through the
+        # temperature ladder (up to 6 passes at beam 5) on audio it cannot
+        # settle on -- music, crosstalk, noise. Without this the whole ASR
+        # stage is one opaque block and "it stopped at chunk 33" gives no way
+        # to tell a slow chunk from a wedged one, or to find the audio that
+        # caused it.
+        t_chunk = time.time()
         chunk_segments = asr_engine.transcribe_chunk(
             audio[a:b], SAMPLE_RATE,
             word_timestamps=(bool(turns) and WORD_LEVEL_DIARIZATION
                              and chunk_spk is None))
+        el = time.time() - t_chunk
+        chunk_s = (b - a) / SAMPLE_RATE
+        chunk_times.append((el, i + 1, a / SAMPLE_RATE, b / SAMPLE_RATE))
+        if el > SLOW_CHUNK_S:
+            print(f"[asr] chunk {i+1}/{n} took {el:.1f}s for {chunk_s:.1f}s of audio "
+                  f"({el/max(chunk_s, .01):.1f}x realtime) at "
+                  f"{a/SAMPLE_RATE:.1f}-{b/SAMPLE_RATE:.1f}s -- suspect Whisper "
+                  f"re-decoding through the temperature ladder; "
+                  f"WHISPER_TEMPERATURES=0.0,0.2 caps that",
+                  file=sys.stderr, flush=True)
         chunk_segments = _dedupe_repeats(chunk_segments)
         off = a / SAMPLE_RATE
 
@@ -1292,6 +1325,13 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
                 _emit(spk_raw, round(r_start, 2), round(r_end, 2), r_text, ws,
                       s.get("confidence"))
                 carry_label, carry_count = spk_raw, len(ws)
+
+    if chunk_times:
+        tot = sum(c[0] for c in chunk_times)
+        worst = max(chunk_times)
+        print(f"[asr] decoded {len(chunk_times)} chunks in {tot:.1f}s "
+              f"(slowest: chunk {worst[1]} at {worst[0]:.1f}s, "
+              f"{worst[2]:.1f}-{worst[3]:.1f}s of audio)", file=sys.stderr, flush=True)
 
     segments.sort(key=lambda s: s["start"])
     speakers = sorted({s["speaker"] for s in segments}, key=lambda x: int(x[1:]))

@@ -417,6 +417,7 @@ fp16 tensor-core support.
 | `CHAT_DEVICE` | `auto` | `cpu` keeps the chat model off the GPU entirely; `cuda` forces it on |
 | `JOB_STALL_TIMEOUT` | `300` | Seconds without progress before a job is failed so the UI stops waiting |
 | `DECODE_TIMEOUT` | `600` | Seconds ffmpeg may take before the decode is abandoned as a malformed container |
+| `ASR_SLOW_CHUNK_WARN` | `20` | Seconds after which a single ASR chunk is logged as slow, with its audio timestamps |
 | `CHAT_STATELESS` | `1` (on) | Each question answered independently — prior turns are not sent. `0` keeps the full conversation |
 | `ASR_DEVICE` | `auto` | `cpu` keeps Whisper off the GPU (frees ~4.1 GB for chat, much slower transcription) |
 | `CHAT_MAX_TOKENS` | `350` | Hard ceiling on a reply. Backstop for the brevity instruction; raise it if answers are cut mid-sentence |
