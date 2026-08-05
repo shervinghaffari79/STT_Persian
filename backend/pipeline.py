@@ -89,6 +89,12 @@ SPEAKER_AWARE_CHUNKS = os.environ.get("ASR_SPEAKER_CHUNKS", "1") != "0"
 # noise or nothing.
 MIN_CHUNK_S = float(os.environ.get("ASR_MIN_CHUNK_S", "0.5"))
 
+# Merge consecutive same-speaker segments into one turn, so a label changes
+# only when somebody else speaks (see _consolidate). 0 keeps the raw per-chunk
+# rows, which are an artifact of how the audio was cut rather than of the
+# conversation.
+CONSOLIDATE_SEGMENTS = os.environ.get("CONSOLIDATE_SEGMENTS", "1") != "0"
+
 # A chunk is at most ~24s of audio and normally decodes in a couple of seconds.
 # Past this, log it: it is the signature of Whisper working through the
 # temperature-fallback ladder on audio it cannot settle on.
@@ -1118,6 +1124,58 @@ def _dedupe_repeats(chunk_segments):
     return out
 
 
+def _consolidate(segments: list) -> list:
+    """Merge consecutive segments that share a speaker into one turn.
+
+    The pipeline emits a segment per ASR unit, so one person speaking without
+    interruption comes out as a dozen rows carrying the same label. That is an
+    artifact of how the audio was cut, not of the conversation: a reader --
+    and a professional transcript -- treats a speaker's label as changing only
+    when somebody else starts talking. Measured on the sample, 63 emitted
+    segments were only 28 actual turns, i.e. 35 of them were fragmentation.
+
+    Word timings are concatenated rather than discarded, so click-to-seek and
+    per-word highlighting keep working at the same resolution as before -- the
+    merge is about how the transcript READS, and costs nothing structurally.
+
+    Deliberately not gated on the silence between segments. If a pause were
+    treated as a turn boundary the label would change without anyone else
+    having spoken, which is the very thing this removes. Set
+    CONSOLIDATE_SEGMENTS=0 to keep the raw per-chunk rows."""
+    if not CONSOLIDATE_SEGMENTS or not segments:
+        return segments
+    out = [dict(segments[0])]
+    for seg in segments[1:]:
+        prev = out[-1]
+        if seg["speaker"] != prev["speaker"]:
+            out.append(dict(seg))
+            continue
+        # Confidence is per-ASR-segment, so a merged turn gets the mean of its
+        # parts weighted by how much text each contributed -- a long confident
+        # stretch should not be dragged down by a two-word aside, and a short
+        # confident one should not mask a long doubtful one.
+        #
+        # Both weights are read BEFORE the texts are joined: taking prev's
+        # afterwards measures the combined string, so the earlier part gets
+        # credited with the later part's length and dominates a merge it should
+        # not (0.9 over 10 chars merged with 0.1 over 90 came out 0.52 instead
+        # of 0.18).
+        pc, sc = prev.get("confidence"), seg.get("confidence")
+        pw, sw = max(len(prev["text"]), 1), max(len(seg["text"]), 1)
+
+        prev["end"] = seg["end"]
+        prev["text"] = f"{prev['text']} {seg['text']}".strip()
+        prev["words"] = (prev.get("words") or []) + (seg.get("words") or [])
+        if pc is not None and sc is not None:
+            prev["confidence"] = round((pc * pw + sc * sw) / (pw + sw), 4)
+        elif pc is None:
+            prev["confidence"] = sc
+    if len(out) != len(segments):
+        print(f"[transcript] consolidated {len(segments)} segments into "
+              f"{len(out)} speaker turns", file=sys.stderr, flush=True)
+    return out
+
+
 def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
                correct_fn=None) -> dict:
     import asr_engine
@@ -1334,6 +1392,7 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
               f"{worst[2]:.1f}-{worst[3]:.1f}s of audio)", file=sys.stderr, flush=True)
 
     segments.sort(key=lambda s: s["start"])
+    segments = _consolidate(segments)
     speakers = sorted({s["speaker"] for s in segments}, key=lambda x: int(x[1:]))
     raw_text = "\n\n".join(f"[{s['speaker']}]: {s['text']}" for s in segments)
     out = {

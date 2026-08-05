@@ -339,6 +339,7 @@ check for it before trading accuracy for speed.
 | `DIARIZE_WORD_LEVEL` | `1` | `0` skips Whisper's word-alignment pass (~10–20% faster, coarser speaker splits). Unused when speaker-aligned chunking is on — the label is already known |
 | `ASR_SPEAKER_CHUNKS` | `1` | `0` reverts to VAD-only chunks + per-word speaker reconciliation |
 | `ASR_MIN_CHUNK_S` | `0.5` | Shortest standalone chunk; shorter turn slivers fold into a neighbour |
+| `CONSOLIDATE_SEGMENTS` | `1` (on) | Merge consecutive same-speaker segments into one turn, so a label changes only when someone else speaks |
 | `DEDUPE_THRESHOLD` | `0.6` | Similarity above which an adjacent repeated segment is dropped |
 | `CT2_COMPUTE_TYPE` | `int8_float16` on CUDA | Override the compute type |
 
