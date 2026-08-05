@@ -271,6 +271,117 @@ _FFMPEG_ERR_HINTS = ("error", "invalid", "could not", "no such", "denied",
                      "does not contain")
 
 
+# path -> (recovered_seconds, original_seconds) for files rescued by
+# _recover_truncated_mp4, so transcribe() can surface the shortfall.
+_RECOVERED: dict = {}
+
+_AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000,
+              22050, 16000, 12000, 11025, 8000, 7350]
+
+
+def _recover_truncated_mp4(path: str):
+    """Rebuild a playable AAC stream from an MP4/M4A whose index was cut off.
+
+    An interrupted transfer usually loses the END of the file, and in a
+    non-faststart recording that is the moov -- the index. The audio (mdat)
+    sits earlier and arrives complete, so every sample is physically present
+    and merely unaddressable. ffmpeg refuses the file outright, which throws
+    away a recording that is mostly intact: on the case this was written for,
+    39% of the sample table survived, worth 16 minutes of a 41-minute meeting.
+
+    What survives is enough to reconstruct: stsd/esds give the codec config,
+    and the surviving prefix of stsz gives the byte length of each sample in
+    order. Samples in an audio-only file are laid out back-to-back, so walking
+    those lengths from the first sample recovers frame boundaries without the
+    chunk tables (stco/stsc) that were lost.
+
+    The one unknown is where sample 0 begins -- that IS stco. It is found by
+    scanning: a raw AAC frame starts with a 3-bit element id, so the correct
+    offset is the one where EVERY frame lands on SCE or CPE. On the real file
+    exactly one offset in the first 4 KB satisfied that for 20,000 consecutive
+    frames, and it was 40 rather than the 32 the mdat header implies.
+
+    Returns (adts_bytes, recovered_seconds, total_seconds) or None. Best-effort
+    throughout: anything unexpected returns None and the caller reports the
+    original error."""
+    import struct
+    try:
+        data = open(path, "rb").read()
+        size = len(data)
+
+        # the moov must be the truncated part, and mdat must be whole
+        off, moov_off, mdat_ok = 0, None, False
+        while off + 8 <= size:
+            n = struct.unpack(">I", data[off:off + 4])[0]
+            kind = data[off + 4:off + 8]
+            if n == 1:
+                n = struct.unpack(">Q", data[off + 8:off + 16])[0]
+            if n <= 0:
+                break
+            if kind == b"mdat" and off + n <= size:
+                mdat_ok = True
+            if kind == b"moov" and off + n > size:
+                moov_off = off
+            off += n
+        if moov_off is None or not mdat_ok:
+            return None
+
+        i = data.find(b"stsz", moov_off)
+        if i < 0:
+            return None
+        i -= 4
+        total = struct.unpack(">I", data[i + 16:i + 20])[0]
+        have = (size - (i + 20)) // 4
+        if have < 100:
+            return None
+        sizes = list(struct.unpack(f">{have}I", data[i + 20:i + 20 + have * 4]))
+
+        e = data.find(b"esds", moov_off)
+        if e < 0:
+            return None
+        blob = data[e:e + 120]
+        d = blob.find(b"\x05")               # DecoderSpecificInfo
+        if d < 0:
+            return None
+        bits = int.from_bytes(blob[d + 2:d + 4], "big")
+        obj, fi, ch = (bits >> 11) & 0x1F, (bits >> 7) & 0xF, (bits >> 3) & 0xF
+        if obj not in (2, 5) or fi >= len(_AAC_RATES) or not 1 <= ch <= 7:
+            return None                      # only plain AAC-LC/HE is handled
+        rate = _AAC_RATES[fi]
+
+        # locate sample 0: the offset at which every frame starts on a
+        # syntactic element (SCE=0 / CPE=1), which stco would otherwise say
+        def valid(start, n):
+            pos = start
+            for k in range(min(n, len(sizes))):
+                if pos + sizes[k] > size or data[pos] >> 5 > 1:
+                    return False
+                pos += sizes[k]
+            return True
+
+        first = next((o for o in range(8, 8192) if valid(o, 400)), None)
+        if first is None or not valid(first, min(20000, len(sizes))):
+            return None
+
+        out, pos, kept = bytearray(), first, 0
+        for n in sizes:
+            if pos + n > size:
+                break
+            fl = n + 7
+            out += bytes([0xFF, 0xF1,
+                          ((obj - 1) << 6) | (fi << 2) | ((ch >> 2) & 1),
+                          ((ch & 3) << 6) | ((fl >> 11) & 3),
+                          (fl >> 3) & 0xFF,
+                          ((fl & 7) << 5) | 0x1F, 0xFC]) + data[pos:pos + n]
+            pos += n
+            kept += 1
+        if kept < 100:
+            return None
+        return bytes(out), kept * 1024 / rate, total * 1024 / rate
+    except Exception:
+        return None
+
+
 def _diagnose_container(path: str) -> str:
     """Explain WHY an MP4/M4A/MOV failed, by walking its top-level atoms.
 
@@ -417,6 +528,30 @@ def decode_audio(path: str, progress=None) -> np.ndarray:
         # interrupted mid-save). Surface this as a real error instead of silently
         # producing an empty "done" transcription.
         stderr = proc.stderr.decode("utf-8", "ignore")
+
+        # Before giving up: if this is an MP4/M4A whose index was truncated in
+        # transfer, the audio itself is usually still there and addressable
+        # from what survived. Recovering part of a meeting beats rejecting all
+        # of it, so long as the user is told exactly how much they got.
+        rec = _recover_truncated_mp4(path)
+        if rec is not None:
+            adts, got_s, total_s = rec
+            print(f"[decode] container index truncated -- recovered "
+                  f"{got_s/60:.1f} of {total_s/60:.1f} minutes from the intact "
+                  f"audio data", file=sys.stderr, flush=True)
+            tmp = Path(path).with_suffix(".recovered.aac")
+            try:
+                tmp.write_bytes(adts)
+                audio = decode_audio(str(tmp), progress=progress)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if len(audio):
+                _RECOVERED[path] = (got_s, total_s)
+                return audio
+
         # Inspect the container ourselves. ffmpeg names the symptom but not the
         # cause, and "audio is corrupt" and "audio is fine, the index was cut
         # off in transfer" need completely different responses from the user.
@@ -1500,6 +1635,15 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
     # the log. A transcript where every line is S1 is indistinguishable from a
     # badly-diarized one unless something says which happened, and nobody
     # reads the backend console before reporting "diarization is broken".
+    rec = _RECOVERED.pop(path, None)
+    if rec:
+        got_s, total_s = rec
+        out["truncatedWarning"] = (
+            f"This file's index was truncated in transfer, so only "
+            f"{got_s/60:.1f} of its {total_s/60:.1f} minutes could be read. The "
+            f"audio that survived was transcribed in full; the remaining "
+            f"{(total_s-got_s)/60:.1f} minutes are not present in the file and "
+            f"need a fresh export from the source.")
     if diarize and DIARIZER != "off" and diarizer_used == "none":
         out["diarizationWarning"] = (
             "No diarizer ran, so every segment is labelled S1. This is not a "
