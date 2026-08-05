@@ -148,14 +148,22 @@ def _run_job(job_id: str, tmp_path: str, filename: str, diarize: bool, gpt_corre
     partial: list = []
     seen_speakers: set = set()
 
-    def on_segment(seg):
+    def on_segment(seg, replace=False):
         # The live list is registered in JOBS once (below) and appended to in
         # place. It used to be re-copied on EVERY segment -- list(partial) --
         # alongside a full rescan of every segment's speaker, so publishing n
         # segments cost O(n^2) and grew quadratically with recording length,
         # on the same thread doing the transcription.
+        #
+        # replace=True means the pipeline grew the turn already at the tail
+        # rather than starting a new one (a speaker still holding the floor),
+        # so it is overwritten in place. The client re-fetches from len-1 to
+        # pick that growth up -- see localAsr.ts.
         with JOBS_LOCK:
-            partial.append(seg)
+            if replace and partial:
+                partial[-1] = seg
+            else:
+                partial.append(seg)
             JOBS.setdefault(job_id, {})["updated"] = time.time()
             if seg["speaker"] not in seen_speakers:
                 seen_speakers.add(seg["speaker"])
@@ -494,6 +502,12 @@ async def chat_title(req: Request):
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...), diarize: str = Form("true"),
                      gpt_correct: str = Form("true")):
+    # Logged on ENTRY, before the body is touched. The existing [upload] line
+    # only prints once the file is fully on disk, so a request that never
+    # arrived and one that arrived and stalled mid-body look identical -- both
+    # simply produce no output. A reported hang on the upload after a completed
+    # job showed exactly that: no [upload] line, and no way to tell which.
+    print(f"[upload] receiving {file.filename!r}…", flush=True)
     if not pipeline.model_available():
         raise HTTPException(500, f"No ASR model found (checked {pipeline.model_dir()})")
     suffix = Path(file.filename or "audio").suffix or ".bin"

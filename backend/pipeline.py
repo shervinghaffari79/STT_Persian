@@ -1124,6 +1124,33 @@ def _dedupe_repeats(chunk_segments):
     return out
 
 
+def merge_turn(prev: dict, seg: dict) -> dict:
+    """Fold `seg` into the turn `prev`, returning the combined turn.
+
+    Shared by the final consolidation pass and the live stream, so a turn a
+    viewer watched being built is byte-identical to the one in the finished
+    transcript.
+
+    Confidence is per-ASR-segment, so a merged turn gets the mean of its parts
+    weighted by how much text each contributed -- a long confident stretch
+    should not be dragged down by a two-word aside, nor a short confident one
+    mask a long doubtful one. Both weights are read BEFORE the texts are
+    joined: taking prev's afterwards measures the combined string and credits
+    the earlier part with the later part's length (0.9 over 10 chars merged
+    with 0.1 over 90 came out 0.52 instead of 0.18)."""
+    pc, sc = prev.get("confidence"), seg.get("confidence")
+    pw, sw = max(len(prev["text"]), 1), max(len(seg["text"]), 1)
+    out = dict(prev)
+    out["end"] = seg["end"]
+    out["text"] = f"{prev['text']} {seg['text']}".strip()
+    out["words"] = (prev.get("words") or []) + (seg.get("words") or [])
+    if pc is not None and sc is not None:
+        out["confidence"] = round((pc * pw + sc * sw) / (pw + sw), 4)
+    elif pc is None:
+        out["confidence"] = sc
+    return out
+
+
 def _consolidate(segments: list) -> list:
     """Merge consecutive segments that share a speaker into one turn.
 
@@ -1146,30 +1173,10 @@ def _consolidate(segments: list) -> list:
         return segments
     out = [dict(segments[0])]
     for seg in segments[1:]:
-        prev = out[-1]
-        if seg["speaker"] != prev["speaker"]:
+        if seg["speaker"] != out[-1]["speaker"]:
             out.append(dict(seg))
-            continue
-        # Confidence is per-ASR-segment, so a merged turn gets the mean of its
-        # parts weighted by how much text each contributed -- a long confident
-        # stretch should not be dragged down by a two-word aside, and a short
-        # confident one should not mask a long doubtful one.
-        #
-        # Both weights are read BEFORE the texts are joined: taking prev's
-        # afterwards measures the combined string, so the earlier part gets
-        # credited with the later part's length and dominates a merge it should
-        # not (0.9 over 10 chars merged with 0.1 over 90 came out 0.52 instead
-        # of 0.18).
-        pc, sc = prev.get("confidence"), seg.get("confidence")
-        pw, sw = max(len(prev["text"]), 1), max(len(seg["text"]), 1)
-
-        prev["end"] = seg["end"]
-        prev["text"] = f"{prev['text']} {seg['text']}".strip()
-        prev["words"] = (prev.get("words") or []) + (seg.get("words") or [])
-        if pc is not None and sc is not None:
-            prev["confidence"] = round((pc * pw + sc * sw) / (pw + sw), 4)
-        elif pc is None:
-            prev["confidence"] = sc
+        else:
+            out[-1] = merge_turn(out[-1], seg)
     if len(out) != len(segments):
         print(f"[transcript] consolidated {len(segments)} segments into "
               f"{len(out)} speaker turns", file=sys.stderr, flush=True)
@@ -1275,6 +1282,7 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
     # absorb a short standalone segment into its neighbour even when that
     # neighbour came from a different transcribe_chunk() call entirely
     carry_label, carry_count = None, 0
+    live: list = []   # turns published to on_segment so far
     chunk_times: list = []
     n = len(chunks)
     for i, (a, b, chunk_spk) in enumerate(chunks):
@@ -1310,6 +1318,29 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
         chunk_segments = _dedupe_repeats(chunk_segments)
         off = a / SAMPLE_RATE
 
+        def _stream(seg):
+            """Publish at TURN granularity, live.
+
+            The consolidation that made the finished transcript readable ran
+            only at the end, so while a job was in flight the viewer still saw
+            one row per ASR chunk and everything collapsed at completion.
+            Instead the current turn is GROWN in place while its speaker holds
+            the floor and finalised when somebody else starts, so what is on
+            screen during the job is already what the transcript will say.
+
+            The last published turn is therefore mutable, which is why
+            on_segment takes `replace`: server.py overwrites the tail of the
+            partial list rather than appending, and the client re-fetches from
+            len-1 so it picks the growth up."""
+            if not on_segment:
+                return
+            if CONSOLIDATE_SEGMENTS and live and live[-1]["speaker"] == seg["speaker"]:
+                live[-1] = merge_turn(live[-1], seg)
+                on_segment(dict(live[-1]), True)
+            else:
+                live.append(dict(seg))
+                on_segment(dict(seg), False)
+
         def _emit(spk_raw, st, en, raw, words, confidence):
             """Label, normalize, optionally correct, and publish one segment."""
             if spk_raw not in label_map:
@@ -1335,8 +1366,7 @@ def transcribe(path: str, diarize: bool = True, progress=None, on_segment=None,
             segments.append(seg)
             if text:
                 recent_context.append(f"{spk}: {text}")
-            if on_segment:
-                on_segment(seg)
+            _stream(seg)
 
         for s in chunk_segments:
             raw = s["text"].strip()

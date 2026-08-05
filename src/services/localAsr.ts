@@ -57,24 +57,29 @@ export async function transcribeLocal(
   const maxAttempts = 2400; // ~2h ceiling for very long audio
   for (let i = 0; i < maxAttempts; i++) {
     await sleep(1200);
-    const resp = await fetch(`${API}/status/${jobId}?since=${acc.length}`);
+    // Re-fetch from the LAST turn, not past it. The backend grows the current
+    // turn in place while one speaker holds the floor (see pipeline._stream),
+    // so the tail of `acc` is not final until somebody else starts talking.
+    // Asking from acc.length would skip that growth and the turn would stay
+    // frozen at its first sentence until the speaker changed.
+    const since = Math.max(0, acc.length - 1);
+    const resp = await fetch(`${API}/status/${jobId}?since=${since}`);
     if (!resp.ok) throw new Error(`Status check failed (${resp.status})`);
     const data = await resp.json();
 
     onProgress?.(data.message || 'Processing…', typeof data.progress === 'number' ? data.progress : 50);
 
-    // stream newly-produced segments to the UI as they arrive
+    // stream turns to the UI as they arrive; `fresh` starts at `since`, so it
+    // re-states the possibly-grown last turn and then adds any new ones
     const fresh = (data.partial || []) as TranscriptSegment[];
     if (fresh.length) {
-      // partial_total is the backend's authoritative count. If it disagrees
-      // with what we hold after appending, our view has drifted (a restarted
-      // job reusing the id, an older backend ignoring `since`) -- trust the
-      // backend and take its payload as the whole truth instead of appending
-      // onto a bad prefix.
+      const next = acc.slice(0, since).concat(fresh);
+      // partial_total is the backend's authoritative count. A disagreement
+      // means our view drifted (a restarted job reusing the id, an older
+      // backend ignoring `since`) -- trust the backend rather than build on a
+      // bad prefix.
       const total = data.partial_total;
-      acc = typeof total === 'number' && total !== acc.length + fresh.length
-        ? fresh
-        : acc.concat(fresh);
+      acc = typeof total === 'number' && total !== next.length ? fresh : next;
       onPartial?.(acc, (data.speakers || []) as string[]);
     }
 
