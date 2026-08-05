@@ -271,6 +271,63 @@ _FFMPEG_ERR_HINTS = ("error", "invalid", "could not", "no such", "denied",
                      "does not contain")
 
 
+def _diagnose_container(path: str) -> str:
+    """Explain WHY an MP4/M4A/MOV failed, by walking its top-level atoms.
+
+    ffmpeg reports the symptom ("STSZ atom truncated") but not the cause, and
+    the two look the same from outside: a file whose audio is genuinely
+    corrupt, and one whose audio is perfectly intact but whose index was cut
+    off mid-write by an interrupted transfer. Only the second is worth
+    re-exporting for, and no ffmpeg flag can rescue it -- the index IS the
+    thing that says where each audio sample starts.
+
+    Returns a sentence to append to the error, or "" when nothing conclusive
+    was found (including for non-MP4 containers, which have no atoms)."""
+    import struct
+    try:
+        size = os.path.getsize(path)
+        atoms, off = [], 0
+        with open(path, "rb") as fh:
+            while off < size and len(atoms) < 32:
+                fh.seek(off)
+                head = fh.read(8)
+                if len(head) < 8:
+                    break
+                n = struct.unpack(">I", head[:4])[0]
+                kind = head[4:8].decode("latin1", "ignore")
+                if n == 1:                      # 64-bit extended size
+                    ext = fh.read(8)
+                    if len(ext) < 8:
+                        break
+                    n = struct.unpack(">Q", ext)[0]
+                if n <= 0:
+                    break
+                atoms.append((kind, off, n, off + n > size))
+                off += n
+        if not any(k in ("ftyp", "moov", "mdat") for k, _, _, _ in atoms):
+            return ""                            # not an MP4-family file
+        short = [(k, o, n) for k, o, n, over in atoms if over]
+        if not short:
+            return ""
+        kind, o, n = short[0]
+        missing = (o + n) - size
+        audio_ok = any(k == "mdat" and not over for k, _, _, over in atoms)
+        what = {"moov": "index (which sample starts where)",
+                "mdat": "audio data"}.get(kind, kind)
+        msg = (f" The file is TRUNCATED: its '{kind}' atom -- the {what} -- claims "
+               f"{n:,} bytes but only {size - o:,} are present, so {missing:,} bytes "
+               "are missing from the end.")
+        if audio_ok and kind == "moov":
+            msg += (" The audio itself (mdat) is complete, but without the index "
+                    "nothing can locate the samples, which is why no ffmpeg option "
+                    "recovers it. The upload or export was cut short -- re-export "
+                    "the recording from the source (re-downloading the same "
+                    "truncated copy will not help).")
+        return msg
+    except Exception:
+        return ""
+
+
 def _ffmpeg_error(stderr: bytes, limit: int = 300) -> str:
     """The informative part of ffmpeg's stderr, banner stripped."""
     text = stderr.decode("utf-8", "ignore")
@@ -360,9 +417,14 @@ def decode_audio(path: str, progress=None) -> np.ndarray:
         # interrupted mid-save). Surface this as a real error instead of silently
         # producing an empty "done" transcription.
         stderr = proc.stderr.decode("utf-8", "ignore")
-        hint = ""
-        if "truncated" in stderr.lower() or "moov atom not found" in stderr.lower():
-            hint = " The file's internal index looks corrupted/incomplete (interrupted recording or transfer)."
+        # Inspect the container ourselves. ffmpeg names the symptom but not the
+        # cause, and "audio is corrupt" and "audio is fine, the index was cut
+        # off in transfer" need completely different responses from the user.
+        hint = _diagnose_container(path)
+        if not hint and ("truncated" in stderr.lower()
+                         or "moov atom not found" in stderr.lower()):
+            hint = (" The file's internal index looks corrupted or incomplete "
+                    "(interrupted recording or transfer).")
         raise RuntimeError(f"No audio could be decoded from this file.{hint} ffmpeg said: "
                           f"{_ffmpeg_error(proc.stderr)}")
     return np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
