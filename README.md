@@ -190,6 +190,10 @@ npm install
 ```powershell
 .\run.ps1
 ```
+or, from `cmd.exe`:
+```bat
+run.bat
+```
 This starts the backend (FastAPI, `127.0.0.1:8000`, **not** network-exposed)
 and the frontend (Vite, `0.0.0.0:5000`, network/internet-exposed) the same way
 `run.sh` does on macOS/Linux. **Only port 5000 needs to be reachable from
@@ -221,7 +225,9 @@ it from being hit directly.
 
 ### Notes
 - **Custom ports:** `$env:BACKEND_PORT` (default 8000) and
-  `$env:FRONTEND_PORT` (default 5000), set before running `.\run.ps1`.
+  `$env:FRONTEND_PORT` (default 5000), set before running `.\run.ps1`
+  (`set BACKEND_PORT=...` / `set FRONTEND_PORT=...` before `run.bat` in
+  `cmd.exe`).
 - **Force a specific backend** if auto-detection ever guesses wrong:
   `$env:ASR_BACKEND="ctranslate2"`, `$env:CHAT_BACKEND="transformers"` (values:
   `mlx` | `ctranslate2` for ASR, `mlx` | `transformers` for chat, or `auto`).
