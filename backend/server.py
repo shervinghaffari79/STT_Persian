@@ -38,6 +38,24 @@ import os
 # that the following full-transcript request cannot use.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# Bound every huggingface_hub network call (etag/metadata checks as well as
+# downloads). Without this, loading an ALREADY-CACHED model (pyannote,
+# speechbrain, the chat model) still does a network round-trip to check for
+# updates, and huggingface_hub's own default timeout is long enough that a
+# silently-stalling connection -- a proxy/firewall that accepts the TCP
+# handshake but never sends a response, which is what a locked-down Windows
+# Server network tends to produce instead of a clean refused/unreachable --
+# hangs warmup or a job indefinitely with no log output at all. That is
+# indistinguishable from a genuine deadlock until someone hits Ctrl-C, which
+# then delivers SIGINT to a thread blocked in native (requests/urllib3) code
+# and has crashed the whole process rather than cleanly unblocking it.
+# Existing exception handling around every Hub call (_load_pyannote_locked,
+# chat.py's _ensure) already logs and falls back correctly -- it just never
+# used to get the chance to run. 20s is generous for a real network hiccup
+# but short enough to fail fast against a genuinely stalled connection.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "20")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "20")
+
 import shutil
 import threading
 import time
