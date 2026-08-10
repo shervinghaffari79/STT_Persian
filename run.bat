@@ -26,7 +26,14 @@ if not defined FRONTEND_PORT set "FRONTEND_PORT=5000"
 set "BACKEND_TITLE=STT_Backend_%RANDOM%"
 
 echo -^> starting backend (FastAPI, 127.0.0.1:%BACKEND_PORT%, not exposed) ...
-start "%BACKEND_TITLE%" /MIN cmd /c "cd /d "%~dp0backend" && set HOST=127.0.0.1&& set PORT=%BACKEND_PORT%&& python server.py"
+REM Set these in THIS process; the started child inherits them. Doing it inside
+REM the child's command line instead needs `cmd /c "cd /d "..." && set ..."`,
+REM whose nested quotes cmd parses unreliably. Always the quoted `set "X=Y"`
+REM form: the bare `set X=Y && ...` form captures the space before `&&` INTO
+REM the value, and a HOST of "127.0.0.1 " fails to resolve.
+set "HOST=127.0.0.1"
+set "PORT=%BACKEND_PORT%"
+start "%BACKEND_TITLE%" /MIN /D "%~dp0backend" cmd /c python server.py
 
 REM wait for backend health
 set "READY=0"
@@ -46,8 +53,8 @@ if "%READY%"=="1" (
 )
 
 echo -^> starting frontend (Vite, 0.0.0.0:%FRONTEND_PORT%, network-exposed) ...
-set "BACKEND_PORT=%BACKEND_PORT%"
-set "FRONTEND_PORT=%FRONTEND_PORT%"
+REM BACKEND_PORT/FRONTEND_PORT are already set in this process and npm inherits
+REM them; vite.config.ts reads both.
 call npm run dev
 
 echo.

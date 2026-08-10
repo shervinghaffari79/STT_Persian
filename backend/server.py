@@ -595,6 +595,12 @@ def status(job_id: str, since: int = 0):
 
 if __name__ == "__main__":
     import uvicorn
-    host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8000"))
+    # .strip() both: in cmd.exe, `set HOST=127.0.0.1 && ...` puts the space
+    # BEFORE the `&&` inside the value, so HOST becomes "127.0.0.1 " and
+    # uvicorn dies with a bare "[Errno 11001] getaddrinfo failed" -- which
+    # reads like a DNS/network problem rather than a stray character, and
+    # sends you looking at proxies and firewalls. int() already tolerates
+    # surrounding whitespace; getaddrinfo does not.
+    host = os.environ.get("HOST", "127.0.0.1").strip()
+    port = int(os.environ.get("PORT", "8000").strip() or "8000")
     uvicorn.run(app, host=host, port=port, log_level="info")
