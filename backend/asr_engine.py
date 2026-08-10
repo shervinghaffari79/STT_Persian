@@ -26,7 +26,7 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 MLX_MODEL_DIR = Path(os.environ.get("MLX_MODEL_DIR", str(_REPO_ROOT / "models" / "whisper-large-v3-persian-mlx-q8")))
-CT2_MODEL_DIR = Path(os.environ.get("CT2_MODEL_DIR", str(_REPO_ROOT / "models" / "whisper-large-v3-persian-ct2-int8")))
+CT2_MODEL_DIR = Path(os.environ.get("CT2_MODEL_DIR", str(_REPO_ROOT / "models" / "whisper-large-v3")))
 
 # Beam search width. 5 is Whisper's default and what this model was evaluated
 # at; decode cost scales roughly with it, so WHISPER_BEAM_SIZE=1 (greedy) is

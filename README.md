@@ -169,9 +169,11 @@ Check what's actually loaded — model, device, quantization — with
 warning after a real chat message.
 
 ### 1. Get the models onto the server
-- ASR: `models/whisper-large-v3-persian-ct2-int8/` (CTranslate2 int8 Whisper large-v3
-  fine-tuned for Persian) — copy this directory from the repo root, or re-download
-  via `huggingface-cli download` if you have the original model id.
+- ASR: `models/whisper-large-v3/` (CTranslate2 Whisper large-v3 fine-tuned for
+  Persian — contains `model.bin`, `config.json`, `vocabulary.json`,
+  `tokenizer.json`) — copy this directory from the repo root, or re-download
+  via `huggingface-cli download` if you have the original model id. Override
+  the path with `CT2_MODEL_DIR` if it lives somewhere else on your machine.
 - Chat: `Qwen/Qwen3.5-4B` is fetched automatically from Hugging Face the first
   time `backend/chat.py` runs (no manual step, just needs the HF cache to have
   internet access once, and a `transformers` install that recognizes it — see
