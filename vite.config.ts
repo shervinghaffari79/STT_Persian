@@ -22,7 +22,14 @@ export default defineConfig({
     // (backend/server.py) stays on 127.0.0.1 -- never exposed directly -- and
     // is reached only through the proxy below, which runs on this same
     // machine regardless of who is connecting to :5000.
-    host: true,
+    // `true` binds every interface (0.0.0.0). Set FRONTEND_HOST to a specific
+    // address to bind only that one -- the escape hatch for a port already
+    // held by another process on the wildcard address. Windows delivers a
+    // connection to the socket with the MOST SPECIFIC matching local address,
+    // so binding 172.16.x.y:5000 wins over someone else's 0.0.0.0:5000 for
+    // traffic to that IP, without having to evict them. Note that this also
+    // means localhost:5000 then reaches the OTHER process, not Vite.
+    host: process.env.FRONTEND_HOST || true,
     port: Number(process.env.FRONTEND_PORT) || 5000,
     strictPort: true,
     proxy: {
